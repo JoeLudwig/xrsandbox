@@ -1,3 +1,3 @@
 add_subdirectory( xrbase )
-add_subdirectory( helloxr )
+add_subdirectory( xrsandbox )
 

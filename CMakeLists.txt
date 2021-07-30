@@ -1,8 +1,8 @@
 cmake_minimum_required ( VERSION 3.14)
-project( DiligentHelloOpenXR VERSION 0.1.0
-					DESCRIPTION "Hello World project using DiligentEngine and OpenXR"
+project( XRSandbox VERSION 0.1.0
+					DESCRIPTION "A sandbox for XR"
 					LANGUAGES CXX)
-set(NAME DiligentHelloOpenXR)
+set(NAME XRSandbox)
 
 add_subdirectory( thirdparty/DiligentEngine/DiligentCore )
 add_subdirectory( thirdparty/DiligentEngine/DiligentTools )

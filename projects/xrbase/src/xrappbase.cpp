@@ -58,11 +58,6 @@
 #include <RenderDeviceD3D12.h>
 #endif
 
-#if VULKAN_SUPPORTED
-#	define XR_USE_GRAPHICS_API_VULKAN
-#include <vulkan/vulkan.h>
-#endif
-
 #include <openxr/openxr_platform.h>
 #include "graphics_utilities.h"
 #include "igraphicsbinding.h"
