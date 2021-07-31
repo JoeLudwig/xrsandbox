@@ -13,6 +13,15 @@ add_dependencies( xrsandbox xrbase )
 target_link_libraries(xrsandbox
 PRIVATE
 	xrbase
+
+	PhysXExtensions 
+	PhysX 
+	PhysXPvdSDK 
+	PhysXVehicle 
+	PhysXCharacterKinematic 
+	PhysXCooking 
+	PhysXCommon 
+	PhysXFoundation
 )
 
 if(PLATFORM_WIN32 OR PLATFORM_LINUX)
@@ -30,3 +39,24 @@ if( PLATFORM_WIN32 )
 endif()
 
 copy_required_dlls(xrsandbox)
+
+function(copy_physx_dlls TARGET_NAME)
+    list(APPEND PHYSX_DLLS PhysX)
+    list(APPEND PHYSX_DLLS PhysXCharacterKinematic)
+    list(APPEND PHYSX_DLLS PhysXCommon)
+    list(APPEND PHYSX_DLLS PhysXCooking)
+    list(APPEND PHYSX_DLLS PhysXExtensions)
+    list(APPEND PHYSX_DLLS PhysXFoundation)
+    list(APPEND PHYSX_DLLS PhysXPvdSDK)
+    list(APPEND PHYSX_DLLS PhysXTask)
+    list(APPEND PHYSX_DLLS PhysXVehicle)
+
+    foreach(DLL ${PHYSX_DLLS})
+        add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "\"$<TARGET_FILE:${DLL}>\""
+                "\"$<TARGET_FILE_DIR:${TARGET_NAME}>\"")
+    endforeach(DLL)
+endfunction()
+
+copy_physx_dlls(xrsandbox)

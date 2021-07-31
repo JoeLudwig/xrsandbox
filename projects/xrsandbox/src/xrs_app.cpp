@@ -65,6 +65,8 @@
 #include <TextureUtilities.h>
 #include <openxr/openxr.h>
 
+#include <PxPhysicsAPI.h>
+
 // Make sure the supported OpenXR graphics APIs are defined
 #if D3D11_SUPPORTED
 #include <d3d11.h>
@@ -95,6 +97,7 @@ namespace Diligent
 };
 
 using namespace Diligent;
+using namespace physx;
 
 
 typedef std::map< std::string, uint32_t > XrExtensionMap;
@@ -126,9 +129,13 @@ public:
 		if ( !super::Initialize( hWnd ) )
 			return false;
 
+		if ( !InitPhysics() )
+			return false;
+
 		return true;
 	}
 
+	bool InitPhysics();
 
 	virtual void Render() override;
 	virtual void Update( double currTime, double elapsedTime, XrTime displayTime ) override;
@@ -159,6 +166,16 @@ private:
 
 	std::vector< std::unique_ptr<WorldObject> > m_worldObjects;
 	bool m_spawnObject[ 2 ] = { false, false };
+
+	PxDefaultAllocator		m_physxAllocator;
+	PxDefaultErrorCallback	m_physxErrorCallback;
+	PxFoundation*			m_physxFoundation = nullptr;
+	PxPhysics*				m_physxPhysics = nullptr;
+	PxDefaultCpuDispatcher* m_physxDispatcher = nullptr;
+	PxScene*				m_physxScene = nullptr;
+	PxMaterial*				m_physxMaterial = nullptr;
+	PxPvd*					m_physxPvd = nullptr;
+
 };
 
 std::unique_ptr<IApp> CreateApp()
@@ -236,6 +253,37 @@ bool XRSApp::PostSession()
 	return true;
 }
 
+bool XRSApp::InitPhysics()
+{
+	m_physxFoundation = PxCreateFoundation( PX_PHYSICS_VERSION, m_physxAllocator, m_physxErrorCallback );
+
+	m_physxPvd = PxCreatePvd( *m_physxFoundation );
+	PxPvdTransport* transport = PxDefaultPvdSocketTransportCreate( "127.0.0.1", 5425, 10 );
+	m_physxPvd->connect( *transport, PxPvdInstrumentationFlag::eALL );
+
+	m_physxPhysics = PxCreatePhysics( PX_PHYSICS_VERSION, *m_physxFoundation, PxTolerancesScale(), true, m_physxPvd );
+
+	PxSceneDesc sceneDesc( m_physxPhysics->getTolerancesScale() );
+	sceneDesc.gravity = PxVec3( 0.0f, -9.81f, 0.0f );
+	m_physxDispatcher = PxDefaultCpuDispatcherCreate( 2 );
+	sceneDesc.cpuDispatcher = m_physxDispatcher;
+	sceneDesc.filterShader = PxDefaultSimulationFilterShader;
+	m_physxScene = m_physxPhysics->createScene( sceneDesc );
+
+	PxPvdSceneClient* pvdClient = m_physxScene->getScenePvdClient();
+	if ( pvdClient )
+	{
+		pvdClient->setScenePvdFlag( PxPvdSceneFlag::eTRANSMIT_CONSTRAINTS, true );
+		pvdClient->setScenePvdFlag( PxPvdSceneFlag::eTRANSMIT_CONTACTS, true );
+		pvdClient->setScenePvdFlag( PxPvdSceneFlag::eTRANSMIT_SCENEQUERIES, true );
+	}
+	m_physxMaterial = m_physxPhysics->createMaterial( 0.5f, 0.5f, 0.6f );
+
+	PxRigidStatic* groundPlane = PxCreatePlane( *m_physxPhysics, PxPlane( 0, 1, 0, 0 ), *m_physxMaterial );
+	m_physxScene->addActor( *groundPlane );
+	return true;
+}
+
 void XRSApp::UpdateEyeTransforms( float4x4 eyeToProj, float4x4 stageToEye, XrView& view )
 {
 	// Map the buffer and write current world-view-projection matrix
@@ -297,6 +345,7 @@ XrPath HandPath( Hand hand )
 {
 	switch ( hand )
 	{
+	default:
 	case Hand::Left: return Paths().userHandLeft;
 	case Hand::Right: return Paths().userHandRight;
 	}

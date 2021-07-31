@@ -4,3 +4,6 @@
 [submodule "thirdparty/OpenXR-SDK"]
 	path = thirdparty/OpenXR-SDK
 	url = https://github.com/KhronosGroup/OpenXR-SDK.git
+[submodule "thirdparty/PhysX"]
+	path = thirdparty/PhysX
+	url = https://github.com/NVIDIAGameWorks/PhysX.git
