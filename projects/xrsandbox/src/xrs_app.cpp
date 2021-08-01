@@ -102,10 +102,67 @@ using namespace physx;
 
 typedef std::map< std::string, uint32_t > XrExtensionMap;
 
+struct GLTFMeshGeometryPrimitive
+{
+	PxBoxGeometry geometry;
+	Transform geoToNode;
+};
+
+struct GLTFMeshGeometry
+{
+	std::vector<GLTFMeshGeometryPrimitive> primitives;
+	uint32_t nodeIndex = 0;
+	float4x4 nodeToModelUnscaled;
+};
+
+typedef std::vector< std::unique_ptr< GLTFMeshGeometry > > GLTFMeshGeometryVector;
+
+PxVec3 toPx( const float3& v )
+{
+	return { v.x, v.y, v.z };
+}
+PxQuat toPx( const Quaternion& q )
+{
+	return PxQuat( q.q.x, q.q.y, q.q.z, q.q.w );
+}
+PxTransform toPx( const Transform& t )
+{
+	return PxTransform( toPx( t.translation ), toPx( t.rotation ) );
+}
+PxTransform toPx( const float4x4 & m )
+{
+	PxMat44 out;
+	for ( int i = 0; i < 4; i++ )
+	{
+		for ( int j = 0; j < 4; j++ )
+		{
+			out[ i ][ j ] = m[ i ][ j ];
+		}
+	}
+	return PxTransform( out );
+}
+
+float3 toDE( const PxVec3& v )
+{
+	return float3( v.x, v.y, v.z );
+}
+
+
+Quaternion toDE( const PxQuat& q )
+{
+	return Quaternion( q.x, q.y, q.z, q.w );
+}
+
+Transform toDE( const PxTransform& pose )
+{
+	return Transform( toDE( pose.p ), toDE( pose.q ) );
+}
+
 struct WorldObject
 {
-	float4x4 objectToWorld;
+	Transform objectToWorld;
 	std::unique_ptr<GLTF::Model> model;
+	PxRigidActor* actor = nullptr;
 };
 
 class XRSApp: public XrAppBase
@@ -147,12 +204,14 @@ public:
 	virtual void UpdateEyeTransforms( float4x4 eyeToProj, float4x4 stageToEye, XrView& view ) override;
 	void UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime );
 	
-	WorldObject* SpawnObject( const float4x4& objectToWorld, const std::string& modelPath );
+	WorldObject* SpawnObject( const Transform& objectToWorld, const std::string& modelPath );
 private:
+	PxRigidActor* CreateActorForModel( GLTF::Model* mode, const GLTFMeshGeometryVector& geos, const Transform& objectToWorld );
+	
 	RefCntAutoPtr<IPipelineState>		 m_pPSO;
 	RefCntAutoPtr<IShaderResourceBinding> m_pSRB;
 	float4x4							  m_ViewToProj;
-	float4x4							m_handToWorld[ 2 ];
+	Transform							m_handToWorld[ 2 ];
 	bool								m_handToWorldValid[ 2 ] = { false, false };
 
 	std::unique_ptr< XRDE::ActionSet > m_handActionSet;
@@ -171,11 +230,12 @@ private:
 	PxDefaultErrorCallback	m_physxErrorCallback;
 	PxFoundation*			m_physxFoundation = nullptr;
 	PxPhysics*				m_physxPhysics = nullptr;
+	PxCooking*				m_physxCooking = nullptr;
 	PxDefaultCpuDispatcher* m_physxDispatcher = nullptr;
 	PxScene*				m_physxScene = nullptr;
 	PxMaterial*				m_physxMaterial = nullptr;
 	PxPvd*					m_physxPvd = nullptr;
-
+	std::map<std::string, GLTFMeshGeometryVector> m_physxGeometry;
 };
 
 std::unique_ptr<IApp> CreateApp()
@@ -261,6 +321,7 @@ bool XRSApp::InitPhysics()
 	PxPvdTransport* transport = PxDefaultPvdSocketTransportCreate( "127.0.0.1", 5425, 10 );
 	m_physxPvd->connect( *transport, PxPvdInstrumentationFlag::eALL );
 
+	m_physxCooking = PxCreateCooking( PX_PHYSICS_VERSION, *m_physxFoundation, PxCookingParams( PxTolerancesScale() ) );
 	m_physxPhysics = PxCreatePhysics( PX_PHYSICS_VERSION, *m_physxFoundation, PxTolerancesScale(), true, m_physxPvd );
 
 	PxSceneDesc sceneDesc( m_physxPhysics->getTolerancesScale() );
@@ -283,6 +344,7 @@ bool XRSApp::InitPhysics()
 	m_physxScene->addActor( *groundPlane );
 	return true;
 }
+
 
 void XRSApp::UpdateEyeTransforms( float4x4 eyeToProj, float4x4 stageToEye, XrView& view )
 {
@@ -320,7 +382,7 @@ bool XRSApp::RenderEye( int eye )
 	for ( auto& worldObject : m_worldObjects )
 	{
 		GLTF_PBR_Renderer::RenderInfo renderInfo;
-		renderInfo.ModelTransform = worldObject->objectToWorld;
+		renderInfo.ModelTransform = worldObject->objectToWorld.toMatrix();
 		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *worldObject->model, renderInfo, nullptr, &m_CacheBindings );
 	}
 
@@ -353,7 +415,9 @@ XrPath HandPath( Hand hand )
 
 void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 {
-	// read input
+	m_physxScene->simulate( (PxReal)ElapsedTime );
+	m_physxScene->fetchResults( true );	// read input
+
 	XrActiveActionSet activeActionSets[] =
 	{
 		{ m_handActionSet->Handle(), Paths().userHandLeft },
@@ -368,7 +432,7 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 	if( XR_SUCCEEDED( m_handAction->LocateSpace( m_stageSpace, displayTime, Paths().userHandLeft, &spaceLocation ) ) 
 		&& ( spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT ) != 0 )
 	{
-		m_handToWorld[0] = matrixFromPose( spaceLocation.pose );
+		m_handToWorld[0] = toDE( spaceLocation.pose );
 		m_handToWorldValid[ 0 ] = true;
 	}
 	else
@@ -378,7 +442,7 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 	if ( XR_SUCCEEDED( m_handAction->LocateSpace( m_stageSpace, displayTime, Paths().userHandRight, &spaceLocation ) )
 		&& ( spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT ) != 0 )
 	{
-		m_handToWorld[ 1 ] = matrixFromPose( spaceLocation.pose );
+		m_handToWorld[ 1 ] = toDE( spaceLocation.pose );
 		m_handToWorldValid[ 1 ] = true;
 	}
 	else
@@ -401,6 +465,14 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 
 	UpdateHandPoses( m_handTrackers[ 0 ], m_leftHandModel.get(), displayTime );
 	UpdateHandPoses( m_handTrackers[ 1 ], m_rightHandModel.get(), displayTime );
+
+	for ( auto& obj : m_worldObjects )
+	{
+		if ( !obj->actor )
+			continue;
+
+		obj->objectToWorld = toDE( obj->actor->getGlobalPose() );
+	}
 }
 
 XrHandJointEXT GetParentJoint( XrHandJointEXT joint )
@@ -524,10 +596,92 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 	}
 }
 
-WorldObject* XRSApp::SpawnObject( const float4x4& objectToWorld, const std::string& modelPath )
+GLTFMeshGeometryVector GLTFMeshPhysXGeometry( GLTF::Model* model )
+{
+	GLTFMeshGeometryVector geos;
+	for ( auto* node : model->LinearNodes )
+	{
+		if ( !node->pMesh )
+			continue;
+
+		// figure out the scale so we can back it out of everything
+		float4x4 nodeToModel = node->GetMatrix();
+		float xScale = length( float3( 1, 0, 0 ) * nodeToModel );
+		float yScale = length( float3( 0, 1, 0 ) * nodeToModel );
+		float zScale = length( float3( 0, 0, 1 ) * nodeToModel );
+		float3 scale( xScale, yScale, zScale );
+
+		std::unique_ptr<GLTFMeshGeometry> geo = std::make_unique<GLTFMeshGeometry>();
+		geo->nodeIndex = node->Index;
+		geo->nodeToModelUnscaled = float4x4::Scale( scale ).Inverse() * nodeToModel;
+
+		for ( auto& prim : node->pMesh->Primitives )
+		{
+			float3 max = prim.BB.Max * scale;
+			float3 min = prim.BB.Min * scale;
+			float3 size = max - min;
+			float3 halfSize = size / 2.f;
+			float3 offset = halfSize + min;
+
+			GLTFMeshGeometryPrimitive geoPrim;
+			geoPrim.geometry = PxBoxGeometry( toPx( halfSize ) );
+			geoPrim.geoToNode = Transform( offset );
+			geo->primitives.push_back( geoPrim );
+		}
+
+		if ( !geo->primitives.empty() )
+		{
+			geos.push_back( std::move( geo ) );
+		}
+	}
+
+	return std::move( geos );
+}
+
+
+PxRigidActor* XRSApp::CreateActorForModel( GLTF::Model* model, const GLTFMeshGeometryVector& geos, const Transform & objectToWorld )
+{
+	PxRigidDynamic* body = m_physxPhysics->createRigidDynamic( toPx( objectToWorld ) );
+
+	for ( auto& geo : geos )
+	{
+		if ( geo->nodeIndex >= model->LinearNodes.size() )
+			continue;
+
+		GLTF::Node* node = model->LinearNodes[ geo->nodeIndex ];
+		//ASSERT( node->Index == geo->nodeIndex );
+
+		for ( auto& prim : geo->primitives )
+		{
+			PxShape* shape = m_physxPhysics->createShape( prim.geometry, *m_physxMaterial, true );
+			shape->setLocalPose( toPx( prim.geoToNode.toMatrix() * geo->nodeToModelUnscaled ) );
+			body->attachShape( *shape );
+			shape->release();
+		}
+	}
+
+	PxRigidBodyExt::updateMassAndInertia( *body, 10.0f );
+	m_physxScene->addActor( *body );
+
+	return body;
+}
+
+WorldObject* XRSApp::SpawnObject( const Transform& objectToWorld, const std::string& modelPath )
 {
 	auto worldObject = std::make_unique<WorldObject>();
 	worldObject->model = LoadGltfModel( modelPath );
+	if ( !worldObject->model )
+		return nullptr;
+
+	auto iGeo = m_physxGeometry.find( modelPath );
+	if ( iGeo == m_physxGeometry.end() )
+	{
+		auto geos = GLTFMeshPhysXGeometry( worldObject->model.get() );
+		m_physxGeometry[ modelPath ] = std::move( geos );
+		iGeo = m_physxGeometry.find( modelPath );
+	}
+
+	worldObject->actor = CreateActorForModel( worldObject->model.get(), iGeo->second, objectToWorld );
 	worldObject->objectToWorld = objectToWorld;
 	WorldObject* p = worldObject.get();
 	m_worldObjects.push_back( std::move( worldObject ) );

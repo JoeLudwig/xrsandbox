@@ -112,3 +112,45 @@ inline Diligent::float4x4 matrixFromPose( const XrPosef & pose )
 	return quaternionFromXrQuaternion( pose.orientation ).ToMatrix()
 		* Diligent::float4x4::Translation( vectorFromXrVector( pose.position ) );
 }
+
+struct Transform
+{
+	Diligent::Quaternion rotation;
+	Diligent::float3 translation;
+
+	Transform( const Diligent::float3& t )
+	{
+		translation = t;
+		rotation = Diligent::Quaternion( 0, 0, 0, 1.f );
+	}
+
+	Transform( const Diligent::Quaternion & q )
+	{
+		translation = { 0, 0, 0 };
+		rotation = q;
+	}
+
+	Transform( const Diligent::float3& t, const Diligent::Quaternion& q )
+	{
+		translation = t;
+		rotation = q;
+	}
+	Transform()
+	{
+		translation = { 0, 0, 0 };
+		rotation = Diligent::Quaternion( 0, 0, 0, 1.f );
+	}
+
+	Diligent::float4x4 toMatrix() const
+	{
+		return rotation.ToMatrix()
+			* Diligent::float4x4::Translation( translation );
+	}
+};
+
+inline Transform toDE( const XrPosef & pose )
+{
+	return Transform(
+		vectorFromXrVector( pose.position ),
+		quaternionFromXrQuaternion( pose.orientation ) );
+}
