@@ -105,6 +105,8 @@ enum class Hand
 {
 	Left = 0,
 	Right = 1,
+
+	Any = 100,
 };
 
 static const Hand BothHands[] = { Hand::Left, Hand::Right };
@@ -175,11 +177,32 @@ Transform toDE( const PxTransform& pose )
 	return Transform( toDE( pose.p ), toDE( pose.q ) );
 }
 
+inline uint32_t HandFlag( Hand hand )
+{
+	if ( hand == Hand::Any )
+	{
+		return HandFlag( Hand::Left ) | HandFlag( Hand::Right );
+	}
+	else
+	{
+		return 1 << static_cast<int>( hand );
+	}
+}
+
 struct WorldObject
 {
 	Transform objectToWorld;
 	std::unique_ptr<GLTF::Model> model;
 	PxRigidActor* actor = nullptr;
+
+	void clearHandTouch( Hand hand ) { flags = flags & ~HandFlag( hand ); }
+	void addHandTouch( Hand hand ) { flags |= HandFlag( hand ); }
+	bool hasHandTouch( Hand hand ) { return 0 != ( flags & HandFlag( hand ) ); }
+protected:
+	uint32_t flags = 0;
+
+
+
 };
 
 struct InputState
@@ -190,12 +213,12 @@ struct InputState
 	bool grab = false;
 };
 
-struct HandObject
+struct HandState
 {
-	Transform handToWorld;
-	bool validPose = false;
-
+	Transform palmToWorld;
+	WorldObject* touch = nullptr;
 };
+
 
 class XRSApp: public XrAppBase
 {
@@ -234,7 +257,7 @@ public:
 
 	virtual bool RenderEye( int eye ) override;
 	virtual void UpdateEyeTransforms( float4x4 eyeToProj, float4x4 stageToEye, XrView& view ) override;
-	void UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime );
+	void UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime, Transform* palmToWorld );
 	
 	WorldObject* SpawnObject( const Transform& objectToWorld, const std::string& modelPath );
 private:
@@ -244,7 +267,8 @@ private:
 	RefCntAutoPtr<IPipelineState>		 m_pPSO;
 	RefCntAutoPtr<IShaderResourceBinding> m_pSRB;
 	float4x4							  m_ViewToProj;
-	InputState							m_handState[ 2 ];
+	InputState							m_handInput[ 2 ];
+	HandState							m_handState[ 2 ];
 
 	std::unique_ptr< XRDE::ActionSet > m_handActionSet;
 	XRDE::Action * m_handAction;
@@ -266,6 +290,7 @@ private:
 	PxScene*				m_physxScene = nullptr;
 	PxMaterial*				m_physxMaterial = nullptr;
 	PxPvd*					m_physxPvd = nullptr;
+	PxRigidStatic*			m_groundPlane = nullptr;
 	std::map<std::string, GLTFMeshGeometryVector> m_physxGeometry;
 };
 
@@ -370,8 +395,8 @@ bool XRSApp::InitPhysics()
 	}
 	m_physxMaterial = m_physxPhysics->createMaterial( 0.5f, 0.5f, 0.6f );
 
-	PxRigidStatic* groundPlane = PxCreatePlane( *m_physxPhysics, PxPlane( 0, 1, 0, 0 ), *m_physxMaterial );
-	m_physxScene->addActor( *groundPlane );
+	m_groundPlane = PxCreatePlane( *m_physxPhysics, PxPlane( 0, 1, 0, -1.f ), *m_physxMaterial );
+	m_physxScene->addActor( *m_groundPlane );
 	return true;
 }
 
@@ -392,7 +417,7 @@ bool XRSApp::RenderEye( int eye )
 	for ( Hand hand : BothHands )
 	{
 		int i = static_cast<int>( hand );
-		if ( !m_handState[ i ].handToWorldValid )
+		if ( !m_handInput[ i ].handToWorldValid )
 			continue;
 
 		GLTF::Model& model = hand == Hand::Left ? *m_leftHandModel : *m_rightHandModel;
@@ -403,8 +428,16 @@ bool XRSApp::RenderEye( int eye )
 	for ( auto& worldObject : m_worldObjects )
 	{
 		GLTF_PBR_Renderer::RenderInfo renderInfo;
-		renderInfo.ModelTransform = worldObject->objectToWorld.toMatrix();
+		if ( worldObject->hasHandTouch( Hand::Any ) )
+		{
+			renderInfo.ModelTransform = float4x4::Scale( 1.1f ) * worldObject->objectToWorld.toMatrix();
+		}
+		else
+		{
+			renderInfo.ModelTransform = worldObject->objectToWorld.toMatrix();
+		}
 		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *worldObject->model, renderInfo, nullptr, &m_CacheBindings );
+
 	}
 
 	return true;
@@ -450,23 +483,51 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 	syncInfo.countActiveActionSets = sizeof( activeActionSets ) / sizeof( activeActionSets[ 0 ] );
 	xrSyncActions( m_session, &syncInfo );
 
-	InputState oldState[ 2 ] = { m_handState[ 0 ], m_handState[ 1 ] };
+	InputState oldState[ 2 ] = { m_handInput[ 0 ], m_handInput[ 1 ] };
+
+	PxSphereGeometry sphere( 0.05f );
 
 	for ( Hand hand : BothHands )
 	{
 		int i = static_cast<int>( hand );
-		InputState oldState = m_handState[ i ];
-		m_handState[ i ] = ReadInputState( hand, displayTime );
+		InputState oldState = m_handInput[ i ];
+		m_handInput[ i ] = ReadInputState( hand, displayTime );
 
-		if ( !oldState.spawn && m_handState[ i ].spawn && m_handState[ i ].handToWorldValid )
+		if ( m_handInput[ i ].handToWorldValid )
 		{
-			m_hapticAction->ApplyHapticFeedback( m_session, Paths().userHandRight, 0, 20, 1 );
-			SpawnObject( m_handState[ i ].handToWorld, "models/gear.glb" );
+			if ( !oldState.spawn && m_handInput[ i ].spawn && m_handInput[ i ].handToWorldValid )
+			{
+				m_hapticAction->ApplyHapticFeedback( m_session, Paths().userHandRight, 0, 20, 1 );
+				SpawnObject( m_handState[ i ].palmToWorld, "models/gear.glb" );
+			}
+
+			WorldObject* touchedObject = nullptr;
+			PxOverlapBufferN<10> hit;
+			PxQueryFilterData filterData( PxQueryFlag::eDYNAMIC );
+			WorldObject* newTouch = nullptr;
+			if ( m_physxScene->overlap( sphere, toPx( m_handState[ i ].palmToWorld ), hit, filterData ) && hit.hasAnyHits() )
+			{
+				newTouch = static_cast<WorldObject*>( hit.getTouch( 0 ).actor->userData );
+			}
+
+			if ( newTouch != m_handState[ i ].touch )
+			{
+				if ( m_handState[ i ].touch )
+				{
+					m_handState[ i ].touch->clearHandTouch( hand );
+					m_handState[ i ].touch = nullptr;
+				}
+				if ( newTouch )
+				{
+					m_handState[ i ].touch = newTouch;
+					newTouch->addHandTouch( hand );
+				}
+			}
 		}
 	}
 
-	UpdateHandPoses( m_handTrackers[ 0 ], m_leftHandModel.get(), displayTime );
-	UpdateHandPoses( m_handTrackers[ 1 ], m_rightHandModel.get(), displayTime );
+	UpdateHandPoses( m_handTrackers[ 0 ], m_leftHandModel.get(), displayTime, &m_handState[ 0 ].palmToWorld );
+	UpdateHandPoses( m_handTrackers[ 1 ], m_rightHandModel.get(), displayTime, &m_handState[ 1 ].palmToWorld );
 
 	for ( auto& obj : m_worldObjects )
 	{
@@ -526,7 +587,7 @@ uint32_t JointIndexFromHandJoint( XrHandJointEXT handJoint )
 }
 
 
-void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime )
+void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime, Transform *palmToWorld )
 {
 	if ( !m_enableHandTrackers )
 		return;
@@ -596,6 +657,8 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 	{
 		root_node->UpdateTransforms();
 	}
+
+	*palmToWorld = toDE( jointLocations[ XR_HAND_JOINT_PALM_EXT ].pose );
 }
 
 GLTFMeshGeometryVector GLTFMeshPhysXGeometry( GLTF::Model* model )
@@ -686,6 +749,7 @@ WorldObject* XRSApp::SpawnObject( const Transform& objectToWorld, const std::str
 	worldObject->actor = CreateActorForModel( worldObject->model.get(), iGeo->second, objectToWorld );
 	worldObject->objectToWorld = objectToWorld;
 	WorldObject* p = worldObject.get();
+	worldObject->actor->userData = p;
 	m_worldObjects.push_back( std::move( worldObject ) );
 	return p;
 }
