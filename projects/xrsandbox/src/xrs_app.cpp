@@ -360,7 +360,8 @@ bool XRSApp::PostSession()
 
 	CHECK_XR_RESULT( m_handActionSet->SessionInit( m_session ) );
 
-	SetPbrEnvironmentMap( "textures/papermill.ktx" );
+	SetPbrEnvironmentMap( *m_gltfRenderer, "textures/papermill.ktx" );
+	SetPbrEnvironmentMap( *m_highlightRenderer, "textures/highlight_hdr.ktx" );
 
 	m_leftHandModel = LoadGltfModel( "models/valve_hand_models/left_hand.glb" );
 	m_rightHandModel = LoadGltfModel( "models/valve_hand_models/right_hand.glb" );
@@ -428,16 +429,27 @@ bool XRSApp::RenderEye( int eye )
 	for ( auto& worldObject : m_worldObjects )
 	{
 		GLTF_PBR_Renderer::RenderInfo renderInfo;
+		renderInfo.ModelTransform = worldObject->objectToWorld.toMatrix();
+		if ( !worldObject->hasHandTouch( Hand::Any ) )
+		{
+			renderInfo.ModelTransform = float4x4::Scale( 1.1f ) * worldObject->objectToWorld.toMatrix();
+			m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *worldObject->model, renderInfo, nullptr, &m_CacheBindings );
+		}
+
+	}
+
+	m_highlightRenderer->Begin( m_pGraphicsBinding->GetRenderDevice(), m_pGraphicsBinding->GetImmediateContext(),
+		m_CacheUseInfo, m_highlightCacheBindings, m_CameraAttribsCB, m_LightAttribsCB );
+
+	for ( auto& worldObject : m_worldObjects )
+	{
+		GLTF_PBR_Renderer::RenderInfo renderInfo;
+		renderInfo.ModelTransform = worldObject->objectToWorld.toMatrix();
 		if ( worldObject->hasHandTouch( Hand::Any ) )
 		{
 			renderInfo.ModelTransform = float4x4::Scale( 1.1f ) * worldObject->objectToWorld.toMatrix();
+			m_highlightRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *worldObject->model, renderInfo, nullptr, &m_highlightCacheBindings );
 		}
-		else
-		{
-			renderInfo.ModelTransform = worldObject->objectToWorld.toMatrix();
-		}
-		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *worldObject->model, renderInfo, nullptr, &m_CacheBindings );
-
 	}
 
 	return true;

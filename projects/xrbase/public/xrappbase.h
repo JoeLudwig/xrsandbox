@@ -100,7 +100,7 @@ public:
 	bool IsExtensionActive( const std::string& extensionName );
 
 	std::unique_ptr<Diligent::GLTF::Model> LoadGltfModel( const std::string& path );
-	void SetPbrEnvironmentMap( const std::string& environmentMapPath );
+	void SetPbrEnvironmentMap( Diligent::GLTF_PBR_Renderer & renderer, const std::string& environmentMapPath );
 
 protected:
 	void CreateGLTFResourceCache();
@@ -118,7 +118,9 @@ protected:
 	Diligent::RefCntAutoPtr<Diligent::GLTF::ResourceManager> m_pResourceMgr;
 	Diligent::GLTF::ResourceCacheUseInfo           m_CacheUseInfo;
 	Diligent::GLTF_PBR_Renderer::ResourceCacheBindings m_CacheBindings;
+	Diligent::GLTF_PBR_Renderer::ResourceCacheBindings m_highlightCacheBindings;
 	std::unique_ptr< Diligent::GLTF_PBR_Renderer > m_gltfRenderer;
+	std::unique_ptr< Diligent::GLTF_PBR_Renderer > m_highlightRenderer;
 	Diligent::RefCntAutoPtr<Diligent::ITextureView> m_pEnvironmentMapSRV;
 	Diligent::RefCntAutoPtr<Diligent::IBuffer>                m_CameraAttribsCB;
 	Diligent::RefCntAutoPtr<Diligent::IBuffer>                m_LightAttribsCB;

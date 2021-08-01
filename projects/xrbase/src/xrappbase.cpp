@@ -838,6 +838,8 @@ void XrAppBase::CreateGltfRenderer()
 	rendererCi.UseTextureAtals = true;
 	m_gltfRenderer = std::make_unique< GLTF_PBR_Renderer >(
 		m_pGraphicsBinding->GetRenderDevice(), m_pGraphicsBinding->GetImmediateContext(), rendererCi );
+	m_highlightRenderer = std::make_unique< GLTF_PBR_Renderer >(
+		m_pGraphicsBinding->GetRenderDevice(), m_pGraphicsBinding->GetImmediateContext(), rendererCi );
 
 
 	CreateUniformBuffer( m_pGraphicsBinding->GetRenderDevice(), sizeof( CameraAttribs ), "Camera attribs buffer", &m_CameraAttribsCB );
@@ -855,13 +857,13 @@ void XrAppBase::CreateGltfRenderer()
 	m_pGraphicsBinding->GetImmediateContext()->TransitionResourceStates( _countof( Barriers ), Barriers );
 }
 
-void XrAppBase::SetPbrEnvironmentMap( const std::string& environmentMapPath )
+void XrAppBase::SetPbrEnvironmentMap( GLTF_PBR_Renderer & renderer, const std::string& environmentMapPath )
 {
 	RefCntAutoPtr<ITexture> environmentMap;
 	CreateTextureFromFile( environmentMapPath.c_str(), TextureLoadInfo { "Environment Map" }, m_pGraphicsBinding->GetRenderDevice(),
 		&environmentMap );
 	m_pEnvironmentMapSRV = environmentMap->GetDefaultView( TEXTURE_VIEW_SHADER_RESOURCE );
-	m_gltfRenderer->PrecomputeCubemaps( m_pGraphicsBinding->GetRenderDevice(), m_pGraphicsBinding->GetImmediateContext(),
+	renderer.PrecomputeCubemaps( m_pGraphicsBinding->GetRenderDevice(), m_pGraphicsBinding->GetImmediateContext(),
 		m_pEnvironmentMapSRV );
 }
 
