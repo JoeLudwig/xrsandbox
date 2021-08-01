@@ -98,9 +98,26 @@ namespace Diligent
 
 using namespace Diligent;
 using namespace physx;
+using namespace XRDE;
 
 
-typedef std::map< std::string, uint32_t > XrExtensionMap;
+enum class Hand
+{
+	Left = 0,
+	Right = 1,
+};
+
+static const Hand BothHands[] = { Hand::Left, Hand::Right };
+
+XrPath HandPath( Hand hand )
+{
+	switch ( hand )
+	{
+	default:
+	case Hand::Left: return Paths().userHandLeft;
+	case Hand::Right: return Paths().userHandRight;
+	}
+}
 
 struct GLTFMeshGeometryPrimitive
 {
@@ -165,6 +182,21 @@ struct WorldObject
 	PxRigidActor* actor = nullptr;
 };
 
+struct InputState
+{
+	Transform handToWorld;
+	bool handToWorldValid = false;
+	bool spawn = false;
+	bool grab = false;
+};
+
+struct HandObject
+{
+	Transform handToWorld;
+	bool validPose = false;
+
+};
+
 class XRSApp: public XrAppBase
 {
 	typedef XrAppBase super;
@@ -207,12 +239,12 @@ public:
 	WorldObject* SpawnObject( const Transform& objectToWorld, const std::string& modelPath );
 private:
 	PxRigidActor* CreateActorForModel( GLTF::Model* mode, const GLTFMeshGeometryVector& geos, const Transform& objectToWorld );
-	
+	InputState ReadInputState( Hand hand, XrTime displayTime );
+
 	RefCntAutoPtr<IPipelineState>		 m_pPSO;
 	RefCntAutoPtr<IShaderResourceBinding> m_pSRB;
 	float4x4							  m_ViewToProj;
-	Transform							m_handToWorld[ 2 ];
-	bool								m_handToWorldValid[ 2 ] = { false, false };
+	InputState							m_handState[ 2 ];
 
 	std::unique_ptr< XRDE::ActionSet > m_handActionSet;
 	XRDE::Action * m_handAction;
@@ -224,7 +256,6 @@ private:
 	std::unique_ptr<GLTF::Model> m_rightHandModel;
 
 	std::vector< std::unique_ptr<WorldObject> > m_worldObjects;
-	bool m_spawnObject[ 2 ] = { false, false };
 
 	PxDefaultAllocator		m_physxAllocator;
 	PxDefaultErrorCallback	m_physxErrorCallback;
@@ -256,7 +287,6 @@ std::vector<std::string> XRSApp::GetDesiredExtensions()
 
 std::unique_ptr<XRSApp> g_pTheApp;
 
-using namespace XRDE;
 
 bool XRSApp::PreSession()
 {
@@ -359,24 +389,15 @@ bool XRSApp::RenderEye( int eye )
 		m_CacheUseInfo, m_CacheBindings, m_CameraAttribsCB, m_LightAttribsCB );
 
 	// draw the hands if they're available
-	for ( int cube = 0; cube < 2; cube++ )
+	for ( Hand hand : BothHands )
 	{
-		if ( !m_handToWorldValid[ cube ] )
+		int i = static_cast<int>( hand );
+		if ( !m_handState[ i ].handToWorldValid )
 			continue;
 
-		GLTF_PBR_Renderer::RenderInfo renderInfo;
-		renderInfo.ModelTransform = float4x4::Identity();// m_handCubeToWorld[ cube ];
-
-		if ( cube == 0 )
-		{
-			m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *m_leftHandModel, renderInfo,
-				nullptr, &m_CacheBindings );
-		}
-		else
-		{
-			m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *m_rightHandModel, renderInfo,
-				nullptr, &m_CacheBindings );
-		}
+		GLTF::Model& model = hand == Hand::Left ? *m_leftHandModel : *m_rightHandModel;
+		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), model, {},
+			nullptr, &m_CacheBindings );
 	}
 
 	for ( auto& worldObject : m_worldObjects )
@@ -395,23 +416,24 @@ void XRSApp::Render()
 {
 }
 
-enum class Hand
-{
-	Left = 0,
-	Right = 1,
-};
 
-static const Hand BothHands[] = { Hand::Left, Hand::Right };
-
-XrPath HandPath( Hand hand )
+InputState XRSApp::ReadInputState( Hand hand, XrTime displayTime )
 {
-	switch ( hand )
+	XrSpaceLocation spaceLocation = { XR_TYPE_SPACE_LOCATION };
+	InputState state;
+	if ( XR_SUCCEEDED( m_handAction->LocateSpace( m_stageSpace, displayTime, HandPath( hand ), &spaceLocation ) )
+		&& ( spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT ) != 0 )
 	{
-	default:
-	case Hand::Left: return Paths().userHandLeft;
-	case Hand::Right: return Paths().userHandRight;
+		state.handToWorld = toDE( spaceLocation.pose );
+		state.handToWorldValid = true;
 	}
+
+	state.spawn = m_spawnAction->GetBooleanState( m_session, HandPath( hand ) );
+	state.grab = m_grabAction->GetBooleanState( m_session, HandPath( hand ) );
+
+	return state;
 }
+
 
 void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 {
@@ -428,38 +450,18 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 	syncInfo.countActiveActionSets = sizeof( activeActionSets ) / sizeof( activeActionSets[ 0 ] );
 	xrSyncActions( m_session, &syncInfo );
 
-	XrSpaceLocation spaceLocation = { XR_TYPE_SPACE_LOCATION };
-	if( XR_SUCCEEDED( m_handAction->LocateSpace( m_stageSpace, displayTime, Paths().userHandLeft, &spaceLocation ) ) 
-		&& ( spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT ) != 0 )
-	{
-		m_handToWorld[0] = toDE( spaceLocation.pose );
-		m_handToWorldValid[ 0 ] = true;
-	}
-	else
-	{
-		m_handToWorldValid[ 0 ] = false;
-	}
-	if ( XR_SUCCEEDED( m_handAction->LocateSpace( m_stageSpace, displayTime, Paths().userHandRight, &spaceLocation ) )
-		&& ( spaceLocation.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT ) != 0 )
-	{
-		m_handToWorld[ 1 ] = toDE( spaceLocation.pose );
-		m_handToWorldValid[ 1 ] = true;
-	}
-	else
-	{
-		m_handToWorldValid[ 1 ] = false;
-	}
+	InputState oldState[ 2 ] = { m_handState[ 0 ], m_handState[ 1 ] };
 
 	for ( Hand hand : BothHands )
 	{
 		int i = static_cast<int>( hand );
-		bool oldSpawn = m_spawnObject[ i ];
-		m_spawnObject[ i ] = m_spawnAction->GetBooleanState( m_session, HandPath( hand ) );
+		InputState oldState = m_handState[ i ];
+		m_handState[ i ] = ReadInputState( hand, displayTime );
 
-		if ( !oldSpawn && m_spawnObject[ i ] && m_handToWorldValid[ i ] )
+		if ( !oldState.spawn && m_handState[ i ].spawn && m_handState[ i ].handToWorldValid )
 		{
 			m_hapticAction->ApplyHapticFeedback( m_session, Paths().userHandRight, 0, 20, 1 );
-			SpawnObject( m_handToWorld[ i ], "models/gear.glb" );
+			SpawnObject( m_handState[ i ].handToWorld, "models/gear.glb" );
 		}
 	}
 
