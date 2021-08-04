@@ -113,6 +113,17 @@ inline Diligent::float4x4 matrixFromPose( const XrPosef & pose )
 		* Diligent::float4x4::Translation( vectorFromXrVector( pose.position ) );
 }
 
+inline Diligent::Quaternion quatConjugate( const Diligent::Quaternion& q )
+{
+	return Diligent::Quaternion( -q.q.x, -q.q.y, -q.q.z, q.q.w );
+}
+
+inline Diligent::Quaternion quatInverse( const Diligent::Quaternion& q )
+{
+	float mag = Diligent::length( q.q );
+	return Diligent::Quaternion( quatConjugate( q ).q * ( mag == 0 ? 0 : 1 / mag ) );
+}
+
 struct Transform
 {
 	Diligent::Quaternion rotation;
@@ -146,7 +157,23 @@ struct Transform
 		return rotation.ToMatrix()
 			* Diligent::float4x4::Translation( translation );
 	}
+
+	Transform inverse() const
+	{
+		Transform out;
+		out.rotation = quatInverse( rotation );
+		out.translation = out.rotation.RotateVector( translation * -1.f );
+		return out;
+	}
 };
+
+inline Transform operator*( const Transform& t1, const Transform& t2 )
+{
+	Transform out;
+	out.rotation = t2.rotation * t1.rotation;
+	out.translation = t2.rotation.RotateVector( t1.translation ) + t2.translation;
+	return out;
+}
 
 inline Transform toDE( const XrPosef & pose )
 {

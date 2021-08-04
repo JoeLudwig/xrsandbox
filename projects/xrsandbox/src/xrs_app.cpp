@@ -106,6 +106,7 @@ enum class Hand
 	Left = 0,
 	Right = 1,
 
+	None = -1,
 	Any = 100,
 };
 
@@ -193,7 +194,8 @@ struct WorldObject
 {
 	Transform objectToWorld;
 	std::unique_ptr<GLTF::Model> model;
-	PxRigidActor* actor = nullptr;
+	PxRigidDynamic* actor = nullptr;
+	Hand grabbingHand = Hand::None;
 
 	void clearHandTouch( Hand hand ) { flags = flags & ~HandFlag( hand ); }
 	void addHandTouch( Hand hand ) { flags |= HandFlag( hand ); }
@@ -213,10 +215,19 @@ struct InputState
 	bool grab = false;
 };
 
-struct HandState
+enum class HandState
+{
+	Idle,
+	Highlight,
+	Grab,
+};
+
+struct HandInfo
 {
 	Transform palmToWorld;
 	WorldObject* touch = nullptr;
+	HandState state = HandState::Idle;
+	Transform grabbedObjectToHand;
 };
 
 
@@ -261,14 +272,14 @@ public:
 	
 	WorldObject* SpawnObject( const Transform& objectToWorld, const std::string& modelPath );
 private:
-	PxRigidActor* CreateActorForModel( GLTF::Model* mode, const GLTFMeshGeometryVector& geos, const Transform& objectToWorld );
+	PxRigidDynamic* CreateActorForModel( GLTF::Model* mode, const GLTFMeshGeometryVector& geos, const Transform& objectToWorld );
 	InputState ReadInputState( Hand hand, XrTime displayTime );
 
 	RefCntAutoPtr<IPipelineState>		 m_pPSO;
 	RefCntAutoPtr<IShaderResourceBinding> m_pSRB;
 	float4x4							  m_ViewToProj;
 	InputState							m_handInput[ 2 ];
-	HandState							m_handState[ 2 ];
+	HandInfo							m_handInfo[ 2 ];
 
 	std::unique_ptr< XRDE::ActionSet > m_handActionSet;
 	XRDE::Action * m_handAction;
@@ -503,50 +514,115 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 	{
 		int i = static_cast<int>( hand );
 		InputState oldState = m_handInput[ i ];
-		m_handInput[ i ] = ReadInputState( hand, displayTime );
+		InputState& handInput = m_handInput[ i ];
+		HandInfo& handInfo = m_handInfo[ i ];
+		handInput = ReadInputState( hand, displayTime );
 
-		if ( m_handInput[ i ].handToWorldValid )
+		switch ( handInfo.state )
 		{
-			if ( !oldState.spawn && m_handInput[ i ].spawn && m_handInput[ i ].handToWorldValid )
+		case HandState::Highlight:
+		case HandState::Idle:
+			if ( m_handInput[ i ].handToWorldValid )
 			{
-				m_hapticAction->ApplyHapticFeedback( m_session, Paths().userHandRight, 0, 20, 1 );
-				SpawnObject( m_handState[ i ].palmToWorld, "models/gear.glb" );
-			}
-
-			WorldObject* touchedObject = nullptr;
-			PxOverlapBufferN<10> hit;
-			PxQueryFilterData filterData( PxQueryFlag::eDYNAMIC );
-			WorldObject* newTouch = nullptr;
-			if ( m_physxScene->overlap( sphere, toPx( m_handState[ i ].palmToWorld ), hit, filterData ) && hit.hasAnyHits() )
-			{
-				newTouch = static_cast<WorldObject*>( hit.getTouch( 0 ).actor->userData );
-			}
-
-			if ( newTouch != m_handState[ i ].touch )
-			{
-				if ( m_handState[ i ].touch )
+				if ( !oldState.spawn && handInput.spawn && handInput.handToWorldValid )
 				{
-					m_handState[ i ].touch->clearHandTouch( hand );
-					m_handState[ i ].touch = nullptr;
+					m_hapticAction->ApplyHapticFeedback( m_session, Paths().userHandRight, 0, 20, 1 );
+					SpawnObject( m_handInfo[ i ].palmToWorld, "models/gear.glb" );
 				}
-				if ( newTouch )
+
+				WorldObject* touchedObject = nullptr;
+				PxOverlapBufferN<10> hit;
+				PxQueryFilterData filterData( PxQueryFlag::eDYNAMIC );
+				WorldObject* newTouch = nullptr;
+				if ( m_physxScene->overlap( sphere, toPx( handInfo.palmToWorld ), hit, filterData ) && hit.hasAnyHits() )
 				{
-					m_handState[ i ].touch = newTouch;
-					newTouch->addHandTouch( hand );
+					newTouch = static_cast<WorldObject*>( hit.getTouch( 0 ).actor->userData );
+				}
+
+				if ( newTouch != handInfo.touch )
+				{
+					if ( handInfo.touch )
+					{
+						handInfo.touch->clearHandTouch( hand );
+						handInfo.touch = nullptr;
+						handInfo.state = HandState::Idle;
+					}
+					if ( newTouch )
+					{
+						handInfo.state = HandState::Highlight;
+						handInfo.touch = newTouch;
+						newTouch->addHandTouch( hand );
+					}
+				}
+
+				if ( !oldState.grab && handInput.grab && newTouch )
+				{
+					// start grabbing
+					if ( newTouch->grabbingHand != Hand::None && newTouch->grabbingHand != hand )
+					{
+						HandInfo& otherHand = m_handInfo[ static_cast<int>( newTouch->grabbingHand ) ];
+						otherHand.state = HandState::Highlight;
+						newTouch->grabbingHand = Hand::None;
+					}
+
+					newTouch->grabbingHand = hand;
+					Transform objectToWorld = toDE( newTouch->actor->getGlobalPose() );
+					Transform worldToGrabber = handInfo.palmToWorld.inverse();
+					handInfo.grabbedObjectToHand = objectToWorld * worldToGrabber;
+					handInfo.state = HandState::Grab;
+
+					newTouch->actor->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, true );
 				}
 			}
+			break;
+
+		case HandState::Grab:
+			if ( !handInput.grab )
+			{
+				if ( handInfo.touch && handInfo.touch->grabbingHand == hand )
+				{
+					handInfo.touch->grabbingHand = Hand::None;
+					handInfo.touch->actor->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, false );
+				}
+				handInfo.state = HandState::Highlight;
+			}
+			break;
 		}
+
 	}
 
-	UpdateHandPoses( m_handTrackers[ 0 ], m_leftHandModel.get(), displayTime, &m_handState[ 0 ].palmToWorld );
-	UpdateHandPoses( m_handTrackers[ 1 ], m_rightHandModel.get(), displayTime, &m_handState[ 1 ].palmToWorld );
+	UpdateHandPoses( m_handTrackers[ 0 ], m_leftHandModel.get(), displayTime, &m_handInfo[ 0 ].palmToWorld );
+	UpdateHandPoses( m_handTrackers[ 1 ], m_rightHandModel.get(), displayTime, &m_handInfo[ 1 ].palmToWorld );
 
+
+	// should look at using PxActor** activeActors = scene.getActiveActors(nbActiveActors);
+	// to avoid looping over the whole list when most are sleeping
 	for ( auto& obj : m_worldObjects )
 	{
 		if ( !obj->actor )
 			continue;
 
-		obj->objectToWorld = toDE( obj->actor->getGlobalPose() );
+		if ( obj->grabbingHand != Hand::None )
+		{
+			HandInfo& handInfo = m_handInfo[ static_cast<int>( obj->grabbingHand ) ];
+			if ( handInfo.state != HandState::Grab || handInfo.touch != obj.get() )
+			{
+				// this should never happen, but just in case it does, clean up the object
+				obj->grabbingHand = Hand::None;
+			}
+			else
+			{
+				// TODO: Maybe make the object obey the laws of physics instead of teleporting to 
+				// someplace it possibly can't be?
+				obj->objectToWorld = handInfo.grabbedObjectToHand * handInfo.palmToWorld;
+				obj->actor->setKinematicTarget( toPx( obj->objectToWorld ) );
+			}
+		}
+		else
+		{
+			obj->objectToWorld = toDE( obj->actor->getGlobalPose() );
+		}
+
 	}
 }
 
@@ -716,7 +792,7 @@ GLTFMeshGeometryVector GLTFMeshPhysXGeometry( GLTF::Model* model )
 }
 
 
-PxRigidActor* XRSApp::CreateActorForModel( GLTF::Model* model, const GLTFMeshGeometryVector& geos, const Transform & objectToWorld )
+PxRigidDynamic * XRSApp::CreateActorForModel( GLTF::Model* model, const GLTFMeshGeometryVector& geos, const Transform & objectToWorld )
 {
 	PxRigidDynamic* body = m_physxPhysics->createRigidDynamic( toPx( objectToWorld ) );
 
