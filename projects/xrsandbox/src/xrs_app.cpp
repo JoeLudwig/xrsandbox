@@ -232,6 +232,7 @@ struct HandInfo
 	PxRigidDynamic* grabActor = nullptr;
 	PxFixedJoint* grabJoint = nullptr;
 	PxArticulation* articulation = nullptr;
+	std::unique_ptr<GLTF::Model> model;
 };
 
 
@@ -264,7 +265,7 @@ public:
 
 	bool InitPhysics();
 
-	PxArticulation* createHandArticulation( Hand hand, XrHandJointLocationEXT* jointLocations );
+	PxArticulation* createHandArticulation( Hand hand, Transform* jointToParent, float *jointRadius );
 
 	virtual void Render() override;
 	virtual void Update( double currTime, double elapsedTime, XrTime displayTime ) override;
@@ -274,12 +275,13 @@ public:
 
 	virtual bool RenderEye( int eye ) override;
 	virtual void UpdateEyeTransforms( float4x4 eyeToProj, float4x4 stageToEye, XrView& view ) override;
-	void UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime, Transform* palmToWorld );
+	void UpdateHandPoses( Hand hand, XrTime displayTime );
 	
 	WorldObject* SpawnObject( const Transform& objectToWorld, const std::string& modelPath );
 private:
 	PxRigidDynamic* CreateActorForModel( GLTF::Model* mode, const GLTFMeshGeometryVector& geos, const Transform& objectToWorld );
 	InputState ReadInputState( Hand hand, XrTime displayTime );
+	HandInfo& handInfo( Hand hand ) { return m_handInfo[ static_cast<size_t>( hand ) ]; }
 
 	RefCntAutoPtr<IPipelineState>		 m_pPSO;
 	RefCntAutoPtr<IShaderResourceBinding> m_pSRB;
@@ -292,9 +294,6 @@ private:
 	XRDE::Action * m_spawnAction;
 	XRDE::Action * m_grabAction;
 	XRDE::Action * m_hapticAction;
-
-	std::unique_ptr<GLTF::Model> m_leftHandModel;
-	std::unique_ptr<GLTF::Model> m_rightHandModel;
 
 	std::vector< std::unique_ptr<WorldObject> > m_worldObjects;
 
@@ -380,8 +379,8 @@ bool XRSApp::PostSession()
 	SetPbrEnvironmentMap( *m_gltfRenderer, "textures/papermill.ktx" );
 	SetPbrEnvironmentMap( *m_highlightRenderer, "textures/highlight_hdr.ktx" );
 
-	m_leftHandModel = LoadGltfModel( "models/valve_hand_models/left_hand.glb" );
-	m_rightHandModel = LoadGltfModel( "models/valve_hand_models/right_hand.glb" );
+	handInfo( Hand::Left ).model = LoadGltfModel( "models/valve_hand_models/left_hand.glb" );
+	handInfo( Hand::Right ).model = LoadGltfModel( "models/valve_hand_models/right_hand.glb" );
 
 	return true;
 }
@@ -455,8 +454,7 @@ bool XRSApp::RenderEye( int eye )
 		if ( !m_handInput[ i ].handToWorldValid )
 			continue;
 
-		GLTF::Model& model = hand == Hand::Left ? *m_leftHandModel : *m_rightHandModel;
-		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), model, {},
+		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *m_handInfo[i].model, {},
 			nullptr, &m_CacheBindings );
 	}
 
@@ -634,8 +632,8 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 
 	}
 
-	UpdateHandPoses( m_handTrackers[ 0 ], m_leftHandModel.get(), displayTime, &m_handInfo[ 0 ].palmToWorld );
-	UpdateHandPoses( m_handTrackers[ 1 ], m_rightHandModel.get(), displayTime, &m_handInfo[ 1 ].palmToWorld );
+	UpdateHandPoses( Hand::Left, displayTime );
+	UpdateHandPoses( Hand::Right, displayTime );
 
 
 	// should look at using PxActor** activeActors = scene.getActiveActors(nbActiveActors);
@@ -698,7 +696,7 @@ uint32_t JointIndexFromHandJoint( XrHandJointEXT handJoint )
 }
 
 
-PxArticulation* XRSApp::createHandArticulation( Hand hand, XrHandJointLocationEXT *jointLocations )
+PxArticulation* XRSApp::createHandArticulation( Hand hand, Transform *jointToParent, float *jointRadius )
 {
 	PxArticulation* articulation = m_physxPhysics->createArticulation();
 	//PxArticulationLink* links[ XR_HAND_JOINT_COUNT_EXT ] = {};
@@ -719,11 +717,12 @@ PxArticulation* XRSApp::createHandArticulation( Hand hand, XrHandJointLocationEX
 	return articulation;
 }
 
-void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime, Transform *palmToWorld )
+void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 {
 	if ( !m_enableHandTrackers )
 		return;
 
+	HandInfo& handInfo = m_handInfo[ static_cast<int>( hand ) ];
 	XrHandJointsLocateInfoEXT locateInfo = { XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT };
 	locateInfo.time = displayTime;
 	locateInfo.baseSpace = m_stageSpace;
@@ -732,23 +731,27 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 	XrHandJointLocationsEXT locations = { XR_TYPE_HAND_JOINT_LOCATIONS_EXT };
 	locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
 	locations.jointLocations = jointLocations;
-	XrResult res = m_xrLocateHandJointsEXT( handTracker, &locateInfo, &locations );
+	XrResult res = m_xrLocateHandJointsEXT( m_handTrackers[ static_cast<int>( hand ) ], &locateInfo, &locations );
 	if ( XR_FAILED( res ) )
 		return;
 
 	if ( !locations.isActive )
 		return;
 
+	float jointRadius[ XR_HAND_JOINT_COUNT_EXT ];
 	Transform jointsToParent[ XR_HAND_JOINT_COUNT_EXT ];
 	Transform stageToJoint[ XR_HAND_JOINT_COUNT_EXT ];
 
 	// pre-load the wrist because the palm is out of order and earlier in the enum
 	jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
 	stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] = jointsToParent[ XR_HAND_JOINT_WRIST_EXT ].inverse();
+	jointRadius[ XR_HAND_JOINT_WRIST_EXT ] = jointLocations[ XR_HAND_JOINT_WRIST_EXT ].radius;
 	for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
 	{
 		if ( jointIndex == XR_HAND_JOINT_WRIST_EXT )
 			continue;
+
+		jointRadius[ jointIndex ] = jointLocations[ jointIndex ].radius;
 
 		Transform jointToStage = toDE( jointLocations[ jointIndex ].pose );
 		//float4x4 jointToStage = Diligent::float4x4::Translation( vectorFromXrVector( jointLocations[ jointIndex ].pose.position ) );
@@ -766,7 +769,7 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 		}
 	}
 
-	for ( auto& skin : model->Skins )
+	for ( auto& skin : handInfo.model->Skins )
 	{
 		skin->Joints[ 0 ]->Translation = vectorFromXrVector( jointLocations[ 0 ].pose.position );
 		skin->Joints[ 0 ]->Rotation = quaternionFromXrQuaternion( jointLocations[ 0 ].pose.orientation);
@@ -785,12 +788,12 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 		}
 	}
 
-	for ( auto& root_node : model->Nodes )
+	for ( auto& root_node : handInfo.model->Nodes )
 	{
 		root_node->UpdateTransforms();
 	}
 
-	*palmToWorld = toDE( jointLocations[ XR_HAND_JOINT_PALM_EXT ].pose );
+	handInfo.palmToWorld = toDE( jointLocations[ XR_HAND_JOINT_PALM_EXT ].pose );
 }
 
 GLTFMeshGeometryVector GLTFMeshPhysXGeometry( GLTF::Model* model )
