@@ -231,6 +231,7 @@ struct HandInfo
 	Transform grabbedObjectToPalm;
 	PxRigidDynamic* grabActor = nullptr;
 	PxFixedJoint* grabJoint = nullptr;
+	PxArticulation* articulation = nullptr;
 };
 
 
@@ -262,6 +263,8 @@ public:
 	}
 
 	bool InitPhysics();
+
+	PxArticulation* createHandArticulation( Hand hand, XrHandJointLocationEXT* jointLocations );
 
 	virtual void Render() override;
 	virtual void Update( double currTime, double elapsedTime, XrTime displayTime ) override;
@@ -695,6 +698,27 @@ uint32_t JointIndexFromHandJoint( XrHandJointEXT handJoint )
 }
 
 
+PxArticulation* XRSApp::createHandArticulation( Hand hand, XrHandJointLocationEXT *jointLocations )
+{
+	PxArticulation* articulation = m_physxPhysics->createArticulation();
+	//PxArticulationLink* links[ XR_HAND_JOINT_COUNT_EXT ] = {};
+
+	//// make the root joint before looping because of the dumb joint order
+	//links[ XR_HAND_JOINT_WRIST_EXT ] = articulation->createLink( nullptr, toPx( Transform() ) );
+	//for ( XrHandJointEXT joint = XR_HAND_JOINT_PALM_EXT; joint < XR_HAND_JOINT_MAX_ENUM_EXT; ((int&)joint)++ )
+	//{
+	//	if ( joint == XR_HAND_JOINT_WRIST_EXT )
+	//		continue;
+
+	//	PxArticulationLink * parent = links[ GetParentJoint( joint ) ];
+	//	links[ joint ] = articulation->createLink( parent, )
+	//}
+	//PxArticulationLink* link = articulation->createLink( parent, linkPose );
+	//PxRigidActorExt::createExclusiveShape( *link, linkGeometry, material );
+	//PxRigidBodyExt::updateMassAndInertia( *link, 1.0f );
+	return articulation;
+}
+
 void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, XrTime displayTime, Transform *palmToWorld )
 {
 	if ( !m_enableHandTrackers )
@@ -715,20 +739,20 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 	if ( !locations.isActive )
 		return;
 
-	float4x4 jointsToParent[ XR_HAND_JOINT_COUNT_EXT ];
-	float4x4 stageToJoint[ XR_HAND_JOINT_COUNT_EXT ];
+	Transform jointsToParent[ XR_HAND_JOINT_COUNT_EXT ];
+	Transform stageToJoint[ XR_HAND_JOINT_COUNT_EXT ];
 
 	// pre-load the wrist because the palm is out of order and earlier in the enum
-	jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = matrixFromPose( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
-	stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] = jointsToParent[ XR_HAND_JOINT_WRIST_EXT ].Inverse();
+	jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
+	stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] = jointsToParent[ XR_HAND_JOINT_WRIST_EXT ].inverse();
 	for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
 	{
 		if ( jointIndex == XR_HAND_JOINT_WRIST_EXT )
 			continue;
 
-		float4x4 jointToStage = matrixFromPose( jointLocations[ jointIndex ].pose );
+		Transform jointToStage = toDE( jointLocations[ jointIndex ].pose );
 		//float4x4 jointToStage = Diligent::float4x4::Translation( vectorFromXrVector( jointLocations[ jointIndex ].pose.position ) );
-		stageToJoint[ jointIndex ] = jointToStage.Inverse();
+		stageToJoint[ jointIndex ] = jointToStage.inverse();
 
 		XrHandJointEXT parentJoint = GetParentJoint( ( XrHandJointEXT)jointIndex );
 		if ( parentJoint == jointIndex )
@@ -754,9 +778,9 @@ void XRSApp::UpdateHandPoses( XrHandTrackerEXT handTracker, GLTF::Model* model, 
 			uint32_t jointIndex = JointIndexFromHandJoint( (XrHandJointEXT)handJoint );
 
 			GLTF::Node* node = skin->Joints[ jointIndex ];
-			node->Matrix = jointsToParent[ handJoint ];
-			node->Rotation = Quaternion( 0, 0, 0, 1.f );
-			node->Translation = { 0, 0, 0 };
+			node->Matrix = float4x4::Identity();
+			node->Rotation = jointsToParent[ handJoint ].rotation;
+			node->Translation = jointsToParent[ handJoint ].translation;
 			node->Scale = { 1.f, 1.f, 1.f };
 		}
 	}
