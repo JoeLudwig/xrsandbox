@@ -66,6 +66,7 @@
 #include <openxr/openxr.h>
 
 #include <PxPhysicsAPI.h>
+#include <extensions\PxExtensionsAPI.h>
 
 // Make sure the supported OpenXR graphics APIs are defined
 #if D3D11_SUPPORTED
@@ -227,7 +228,9 @@ struct HandInfo
 	Transform palmToWorld;
 	WorldObject* touch = nullptr;
 	HandState state = HandState::Idle;
-	Transform grabbedObjectToHand;
+	Transform grabbedObjectToPalm;
+	PxRigidDynamic* grabActor = nullptr;
+	PxFixedJoint* grabJoint = nullptr;
 };
 
 
@@ -391,6 +394,8 @@ bool XRSApp::InitPhysics()
 	m_physxCooking = PxCreateCooking( PX_PHYSICS_VERSION, *m_physxFoundation, PxCookingParams( PxTolerancesScale() ) );
 	m_physxPhysics = PxCreatePhysics( PX_PHYSICS_VERSION, *m_physxFoundation, PxTolerancesScale(), true, m_physxPvd );
 
+	PxInitExtensions( *m_physxPhysics, m_physxPvd );
+
 	PxSceneDesc sceneDesc( m_physxPhysics->getTolerancesScale() );
 	sceneDesc.gravity = PxVec3( 0.0f, -9.81f, 0.0f );
 	m_physxDispatcher = PxDefaultCpuDispatcherCreate( 2 );
@@ -409,6 +414,21 @@ bool XRSApp::InitPhysics()
 
 	m_groundPlane = PxCreatePlane( *m_physxPhysics, PxPlane( 0, 1, 0, -1.f ), *m_physxMaterial );
 	m_physxScene->addActor( *m_groundPlane );
+
+	for ( Hand hand : BothHands )
+	{
+		PxSphereGeometry sphere( 0.001f );
+		PxShape* shape = m_physxPhysics->createShape( sphere, *m_physxMaterial, true, PxShapeFlag::eVISUALIZATION );
+		HandInfo& handInfo = m_handInfo[ static_cast<int>( hand ) ];
+		handInfo.grabActor = m_physxPhysics->createRigidDynamic( toPx( Transform() ) );
+		handInfo.grabActor->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, true );
+		handInfo.grabActor->attachShape( *shape );
+		m_physxScene->addActor( *handInfo.grabActor );
+	}
+
+	m_physxScene->setVisualizationParameter( PxVisualizationParameter::eJOINT_LOCAL_FRAMES, 1.0f );
+	m_physxScene->setVisualizationParameter( PxVisualizationParameter::eJOINT_LIMITS, 1.0f );
+
 	return true;
 }
 
@@ -490,6 +510,10 @@ InputState XRSApp::ReadInputState( Hand hand, XrTime displayTime )
 	return state;
 }
 
+bool isBroken( PxJoint* joint )
+{
+	return ( static_cast<uint32_t>( joint->getConstraintFlags() ) & PxConstraintFlag::eBROKEN ) != 0;
+}
 
 void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 {
@@ -518,11 +542,17 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 		HandInfo& handInfo = m_handInfo[ i ];
 		handInput = ReadInputState( hand, displayTime );
 
+		// update the grab actor's transform, if we have a new valid transform
+		if ( handInput.handToWorldValid )
+		{
+			handInfo.grabActor->setKinematicTarget( toPx( handInfo.palmToWorld ) );
+		}
+
 		switch ( handInfo.state )
 		{
 		case HandState::Highlight:
 		case HandState::Idle:
-			if ( m_handInput[ i ].handToWorldValid )
+			if ( handInput.handToWorldValid )
 			{
 				if ( !oldState.spawn && handInput.spawn && handInput.handToWorldValid )
 				{
@@ -567,22 +597,32 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 
 					newTouch->grabbingHand = hand;
 					Transform objectToWorld = toDE( newTouch->actor->getGlobalPose() );
-					Transform worldToGrabber = handInfo.palmToWorld.inverse();
-					handInfo.grabbedObjectToHand = objectToWorld * worldToGrabber;
+					Transform worldToPalm = handInfo.palmToWorld.inverse();
+					handInfo.grabbedObjectToPalm = objectToWorld * worldToPalm;
 					handInfo.state = HandState::Grab;
 
-					newTouch->actor->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, true );
+					handInfo.grabJoint = PxFixedJointCreate( *m_physxPhysics,
+						handInfo.grabActor, toPx( Transform() ),
+						newTouch->actor, toPx( handInfo.grabbedObjectToPalm.inverse() ) );
+					static float force = 2.f;
+					static float torque = 0.1f;
+					handInfo.grabJoint->setBreakForce( force, torque );
+					handInfo.grabJoint->setConstraintFlag( PxConstraintFlag::eVISUALIZATION, true );
 				}
 			}
 			break;
 
 		case HandState::Grab:
-			if ( !handInput.grab )
+			if ( !handInput.grab || !handInfo.grabJoint || isBroken( handInfo.grabJoint ) )
 			{
 				if ( handInfo.touch && handInfo.touch->grabbingHand == hand )
 				{
 					handInfo.touch->grabbingHand = Hand::None;
-					handInfo.touch->actor->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, false );
+				}
+				if ( handInfo.grabJoint )
+				{
+					handInfo.grabJoint->release();
+					handInfo.grabJoint = nullptr;
 				}
 				handInfo.state = HandState::Highlight;
 			}
@@ -602,27 +642,7 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 		if ( !obj->actor )
 			continue;
 
-		if ( obj->grabbingHand != Hand::None )
-		{
-			HandInfo& handInfo = m_handInfo[ static_cast<int>( obj->grabbingHand ) ];
-			if ( handInfo.state != HandState::Grab || handInfo.touch != obj.get() )
-			{
-				// this should never happen, but just in case it does, clean up the object
-				obj->grabbingHand = Hand::None;
-			}
-			else
-			{
-				// TODO: Maybe make the object obey the laws of physics instead of teleporting to 
-				// someplace it possibly can't be?
-				obj->objectToWorld = handInfo.grabbedObjectToHand * handInfo.palmToWorld;
-				obj->actor->setKinematicTarget( toPx( obj->objectToWorld ) );
-			}
-		}
-		else
-		{
-			obj->objectToWorld = toDE( obj->actor->getGlobalPose() );
-		}
-
+		obj->objectToWorld = toDE( obj->actor->getGlobalPose() );
 	}
 }
 
