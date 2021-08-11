@@ -232,6 +232,9 @@ struct HandInfo
 	PxRigidDynamic* grabActor = nullptr;
 	PxFixedJoint* grabJoint = nullptr;
 	PxArticulation* articulation = nullptr;
+	std::vector< PxArticulationJoint*> articulationJoints;
+	PxRigidDynamic* jointDriver[ XR_HAND_JOINT_COUNT_EXT ] = {};
+	PxArticulationLink* rootLink = nullptr;
 	std::unique_ptr<GLTF::Model> model;
 };
 
@@ -695,25 +698,118 @@ uint32_t JointIndexFromHandJoint( XrHandJointEXT handJoint )
 	}
 }
 
+bool shouldDriveLink( XrHandJointEXT handJoint )
+{
+	switch ( handJoint )
+	{
+//	case XR_HAND_JOINT_WRIST_EXT:
+	case XR_HAND_JOINT_THUMB_TIP_EXT:
+	case XR_HAND_JOINT_INDEX_TIP_EXT:
+	case XR_HAND_JOINT_MIDDLE_TIP_EXT:
+	case XR_HAND_JOINT_RING_TIP_EXT:
+	case XR_HAND_JOINT_LITTLE_TIP_EXT:
+		return true;
+
+	default: 
+		return false;
+	}
+}
 
 PxArticulation* XRSApp::createHandArticulation( Hand hand, Transform *jointToParent, float *jointRadius )
 {
+	HandInfo& handInfo = this->handInfo( hand );
+
 	PxArticulation* articulation = m_physxPhysics->createArticulation();
-	//PxArticulationLink* links[ XR_HAND_JOINT_COUNT_EXT ] = {};
+	PxArticulationLink* links[ XR_HAND_JOINT_COUNT_EXT ] = {};
 
-	//// make the root joint before looping because of the dumb joint order
-	//links[ XR_HAND_JOINT_WRIST_EXT ] = articulation->createLink( nullptr, toPx( Transform() ) );
-	//for ( XrHandJointEXT joint = XR_HAND_JOINT_PALM_EXT; joint < XR_HAND_JOINT_MAX_ENUM_EXT; ((int&)joint)++ )
-	//{
-	//	if ( joint == XR_HAND_JOINT_WRIST_EXT )
-	//		continue;
+	if ( !handInfo.model || handInfo.model->Skins.empty() )
+	{
+		return nullptr;
+	}
 
-	//	PxArticulationLink * parent = links[ GetParentJoint( joint ) ];
-	//	links[ joint ] = articulation->createLink( parent, )
-	//}
-	//PxArticulationLink* link = articulation->createLink( parent, linkPose );
-	//PxRigidActorExt::createExclusiveShape( *link, linkGeometry, material );
-	//PxRigidBodyExt::updateMassAndInertia( *link, 1.0f );
+	GLTF::Skin& skin = *handInfo.model->Skins.front();
+	if ( skin.Joints.size() != XR_HAND_JOINT_COUNT_EXT )
+	{
+		return nullptr;
+	}
+
+
+	// make the root joint before looping because of the dumb joint order
+	links[ XR_HAND_JOINT_WRIST_EXT ] = articulation->createLink( nullptr, toPx( Transform() ) );
+	PxRigidActorExt::createExclusiveShape( *links[ XR_HAND_JOINT_WRIST_EXT ], PxSphereGeometry( jointRadius[ XR_HAND_JOINT_WRIST_EXT ] ), *m_physxMaterial );
+	PxRigidBodyExt::updateMassAndInertia( *links[ XR_HAND_JOINT_WRIST_EXT ], 10.0f );
+	for ( XrHandJointEXT joint = XR_HAND_JOINT_PALM_EXT; joint < XR_HAND_JOINT_COUNT_EXT; ((int&)joint)++ )
+	{
+		if ( joint == XR_HAND_JOINT_WRIST_EXT )
+			continue;
+		uint32_t jointIndex = JointIndexFromHandJoint( joint );
+
+		GLTF::Node& node = *skin.Joints[ jointIndex ];
+
+		PxArticulationLink * parent = links[ GetParentJoint( joint ) ];
+		links[ joint ] = articulation->createLink( parent, toPx( Transform( node.Translation, node.Rotation ) ) );
+
+		links[ joint ]->setAngularDamping( 5.f );
+	}
+
+	handInfo.articulationJoints.resize( XR_HAND_JOINT_COUNT_EXT, nullptr );
+	for ( XrHandJointEXT joint = XR_HAND_JOINT_PALM_EXT; joint < XR_HAND_JOINT_COUNT_EXT; ( (int&)joint )++ )
+	{
+		PxArticulationLink& link = *links[ joint ];
+
+		uint32_t jointIndex = JointIndexFromHandJoint( joint );
+		GLTF::Node& node = *skin.Joints[ jointIndex ];
+
+		link.setName( node.Name.c_str() );
+
+		PxRigidActorExt::createExclusiveShape( link, PxSphereGeometry( jointRadius[ joint ] ), *m_physxMaterial );
+		PxRigidBodyExt::updateMassAndInertia( link, 1.f );
+		//link.setMass( 0.1f );
+
+		if ( joint != XR_HAND_JOINT_WRIST_EXT )
+		{
+			PxArticulationJoint* jointObj = static_cast<PxArticulationJoint*>( link.getInboundJoint() );
+			jointObj->setDriveType( PxArticulationJointDriveType::eTARGET );
+			handInfo.articulationJoints[ joint ] = jointObj;
+			link.setActorFlag( PxActorFlag::eDISABLE_GRAVITY, true );
+
+			jointObj->setSwingLimitEnabled( true );
+			jointObj->setSwingLimit( -PI_F / 8.f, PI_F / 8.f );
+			jointObj->setTwistLimitEnabled( true );
+			jointObj->setTwistLimit( -PI_F / 16.f, PI_F / 16.f );
+			//jointObj->setParentPose( toPx( Transform() ) );
+			//jointObj->setChildPose( toPx( Transform( node.Translation, node.Rotation ) ) );
+
+			//PxSphereGeometry sphere( 0.001f );
+			//PxShape* shape = m_physxPhysics->createShape( sphere, *m_physxMaterial, true, PxShapeFlag::eVISUALIZATION );
+
+			//handInfo.jointDriver[ joint ] = m_physxPhysics->createRigidDynamic( toPx( Transform() ) );
+			//handInfo.jointDriver[ joint ]->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, true );
+			//handInfo.jointDriver[ joint ]->attachShape( *shape );
+
+			//m_physxScene->addActor( *handInfo.jointDriver[ joint ] );
+
+			if ( shouldDriveLink( joint ) && false )
+			{
+				PxDistanceJoint* driverJoint = PxDistanceJointCreate( *m_physxPhysics,
+					handInfo.jointDriver[ joint ], toPx( Transform() ),
+					&link, toPx( Transform() ) );
+
+				driverJoint->setDistanceJointFlag( PxDistanceJointFlag::eMAX_DISTANCE_ENABLED, true );
+				driverJoint->setMaxDistance( 0.05f );
+				driverJoint->setDistanceJointFlag( PxDistanceJointFlag::eMIN_DISTANCE_ENABLED, true );
+				driverJoint->setMinDistance( 0.0f );
+				driverJoint->setConstraintFlag( PxConstraintFlag::eVISUALIZATION, true );
+			}
+		}
+	}
+
+	m_physxScene->addArticulation( *articulation );
+
+	PxFixedJoint *handJoint = PxFixedJointCreate( *m_physxPhysics,
+			handInfo.grabActor, toPx( Transform() ),
+			links[ XR_HAND_JOINT_WRIST_EXT ], toPx( Transform() ) );
+
 	return articulation;
 }
 
@@ -741,9 +837,10 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 	float jointRadius[ XR_HAND_JOINT_COUNT_EXT ];
 	Transform jointsToParent[ XR_HAND_JOINT_COUNT_EXT ];
 	Transform stageToJoint[ XR_HAND_JOINT_COUNT_EXT ];
+	Transform jointToStage[ XR_HAND_JOINT_COUNT_EXT ];
 
 	// pre-load the wrist because the palm is out of order and earlier in the enum
-	jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
+	jointToStage[ XR_HAND_JOINT_WRIST_EXT ] = jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
 	stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] = jointsToParent[ XR_HAND_JOINT_WRIST_EXT ].inverse();
 	jointRadius[ XR_HAND_JOINT_WRIST_EXT ] = jointLocations[ XR_HAND_JOINT_WRIST_EXT ].radius;
 	for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
@@ -753,20 +850,25 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 
 		jointRadius[ jointIndex ] = jointLocations[ jointIndex ].radius;
 
-		Transform jointToStage = toDE( jointLocations[ jointIndex ].pose );
+		jointToStage[ jointIndex ] = toDE( jointLocations[ jointIndex ].pose );
 		//float4x4 jointToStage = Diligent::float4x4::Translation( vectorFromXrVector( jointLocations[ jointIndex ].pose.position ) );
-		stageToJoint[ jointIndex ] = jointToStage.inverse();
+		stageToJoint[ jointIndex ] = jointToStage[ jointIndex ].inverse();
 
 		XrHandJointEXT parentJoint = GetParentJoint( ( XrHandJointEXT)jointIndex );
 		if ( parentJoint == jointIndex )
 		{
 			// this joint has no parent, so its parent is the stage
-			jointsToParent[ jointIndex ] = jointToStage;
+			jointsToParent[ jointIndex ] = jointToStage[ jointIndex ];
 		}
 		else
 		{
-			jointsToParent[ jointIndex ] = jointToStage * stageToJoint[ parentJoint ];
+			jointsToParent[ jointIndex ] = jointToStage[ jointIndex ] * stageToJoint[ parentJoint ];
 		}
+	}
+
+	if ( !handInfo.articulation )
+	{
+		handInfo.articulation = createHandArticulation( hand, jointsToParent, jointRadius );
 	}
 
 	for ( auto& skin : handInfo.model->Skins )
@@ -791,6 +893,14 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 	for ( auto& root_node : handInfo.model->Nodes )
 	{
 		root_node->UpdateTransforms();
+	}
+
+	for ( XrHandJointEXT handJoint = XR_HAND_JOINT_PALM_EXT; handJoint < XR_HAND_JOINT_COUNT_EXT; ( (int&)handJoint )++ )
+	{
+		if ( handInfo.jointDriver[ handJoint ] )
+		{
+			handInfo.jointDriver[ handJoint ]->setKinematicTarget( toPx( jointToStage[ handJoint ]  ) );
+		}
 	}
 
 	handInfo.palmToWorld = toDE( jointLocations[ XR_HAND_JOINT_PALM_EXT ].pose );
