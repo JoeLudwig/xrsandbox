@@ -225,7 +225,7 @@ enum class HandState
 
 struct HandInfo
 {
-	Transform palmToWorld;
+	Transform wristToWorld;
 	WorldObject* touch = nullptr;
 	HandState state = HandState::Idle;
 	Transform grabbedObjectToPalm;
@@ -233,6 +233,9 @@ struct HandInfo
 	PxFixedJoint* grabJoint = nullptr;
 	PxArticulation* articulation = nullptr;
 	std::unique_ptr<GLTF::Model> model;
+
+	PxRigidDynamic* handCollider = nullptr;
+	PxShape* colliderJoint[ XR_HAND_JOINT_COUNT_EXT ] = {};
 };
 
 
@@ -454,7 +457,9 @@ bool XRSApp::RenderEye( int eye )
 		if ( !m_handInput[ i ].handToWorldValid )
 			continue;
 
-		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *m_handInfo[i].model, {},
+		GLTF_PBR_Renderer::RenderInfo renderInfo;
+		renderInfo.ModelTransform = toDE( handInfo( hand ).handCollider->getGlobalPose() ).toMatrix();
+		m_gltfRenderer->Render( m_pGraphicsBinding->GetImmediateContext(), *m_handInfo[i].model, renderInfo,
 			nullptr, &m_CacheBindings );
 	}
 
@@ -546,7 +551,7 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 		// update the grab actor's transform, if we have a new valid transform
 		if ( handInput.handToWorldValid )
 		{
-			handInfo.grabActor->setKinematicTarget( toPx( handInfo.palmToWorld ) );
+			handInfo.grabActor->setKinematicTarget( toPx( handInfo.wristToWorld ) );
 		}
 
 		switch ( handInfo.state )
@@ -558,14 +563,14 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 				if ( !oldState.spawn && handInput.spawn && handInput.handToWorldValid )
 				{
 					m_hapticAction->ApplyHapticFeedback( m_session, Paths().userHandRight, 0, 20, 1 );
-					SpawnObject( m_handInfo[ i ].palmToWorld, "models/gear.glb" );
+					SpawnObject( m_handInfo[ i ].wristToWorld, "models/gear.glb" );
 				}
 
 				WorldObject* touchedObject = nullptr;
 				PxOverlapBufferN<10> hit;
 				PxQueryFilterData filterData( PxQueryFlag::eDYNAMIC );
 				WorldObject* newTouch = nullptr;
-				if ( m_physxScene->overlap( sphere, toPx( handInfo.palmToWorld ), hit, filterData ) && hit.hasAnyHits() )
+				if ( m_physxScene->overlap( sphere, toPx( handInfo.wristToWorld ), hit, filterData ) && hit.hasAnyHits() )
 				{
 					newTouch = static_cast<WorldObject*>( hit.getTouch( 0 ).actor->userData );
 				}
@@ -598,8 +603,8 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 
 					newTouch->grabbingHand = hand;
 					Transform objectToWorld = toDE( newTouch->actor->getGlobalPose() );
-					Transform worldToPalm = handInfo.palmToWorld.inverse();
-					handInfo.grabbedObjectToPalm = objectToWorld * worldToPalm;
+					Transform worldToWrist = handInfo.wristToWorld.inverse();
+					handInfo.grabbedObjectToPalm = objectToWorld * worldToWrist;
 					handInfo.state = HandState::Grab;
 
 					handInfo.grabJoint = PxFixedJointCreate( *m_physxPhysics,
@@ -741,10 +746,12 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 	float jointRadius[ XR_HAND_JOINT_COUNT_EXT ];
 	Transform jointsToParent[ XR_HAND_JOINT_COUNT_EXT ];
 	Transform stageToJoint[ XR_HAND_JOINT_COUNT_EXT ];
+	Transform jointToStage[ XR_HAND_JOINT_COUNT_EXT ];
 
 	// pre-load the wrist because the palm is out of order and earlier in the enum
-	jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
-	stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] = jointsToParent[ XR_HAND_JOINT_WRIST_EXT ].inverse();
+	jointsToParent[ XR_HAND_JOINT_WRIST_EXT ] = Transform();
+	jointToStage[ XR_HAND_JOINT_WRIST_EXT ] = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
+	stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] = jointToStage[ XR_HAND_JOINT_WRIST_EXT ].inverse();
 	jointRadius[ XR_HAND_JOINT_WRIST_EXT ] = jointLocations[ XR_HAND_JOINT_WRIST_EXT ].radius;
 	for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
 	{
@@ -753,26 +760,24 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 
 		jointRadius[ jointIndex ] = jointLocations[ jointIndex ].radius;
 
-		Transform jointToStage = toDE( jointLocations[ jointIndex ].pose );
+		jointToStage[ jointIndex ] = toDE( jointLocations[ jointIndex ].pose );
 		//float4x4 jointToStage = Diligent::float4x4::Translation( vectorFromXrVector( jointLocations[ jointIndex ].pose.position ) );
-		stageToJoint[ jointIndex ] = jointToStage.inverse();
+		stageToJoint[ jointIndex ] = jointToStage[ jointIndex ].inverse();
 
 		XrHandJointEXT parentJoint = GetParentJoint( ( XrHandJointEXT)jointIndex );
 		if ( parentJoint == jointIndex )
 		{
-			// this joint has no parent, so its parent is the stage
-			jointsToParent[ jointIndex ] = jointToStage;
+			// this joint has no parent, so its parent is the model
+			jointsToParent[ jointIndex ] = Transform();
 		}
 		else
 		{
-			jointsToParent[ jointIndex ] = jointToStage * stageToJoint[ parentJoint ];
+			jointsToParent[ jointIndex ] = jointToStage[ jointIndex ] * stageToJoint[ parentJoint ];
 		}
 	}
 
 	for ( auto& skin : handInfo.model->Skins )
 	{
-		skin->Joints[ 0 ]->Translation = vectorFromXrVector( jointLocations[ 0 ].pose.position );
-		skin->Joints[ 0 ]->Rotation = quaternionFromXrQuaternion( jointLocations[ 0 ].pose.orientation);
 		for ( uint32_t handJoint = 0; handJoint < 26; handJoint++ )
 		{
 			//if ( handJoint > XR_HAND_JOINT_THUMB_TIP_EXT )
@@ -793,8 +798,41 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 		root_node->UpdateTransforms();
 	}
 
-	handInfo.palmToWorld = toDE( jointLocations[ XR_HAND_JOINT_PALM_EXT ].pose );
+	if ( !handInfo.handCollider )
+	{
+		handInfo.handCollider = m_physxPhysics->createRigidDynamic( toPx( jointsToParent[ XR_HAND_JOINT_WRIST_EXT ]) );
+
+		for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
+		{
+			handInfo.colliderJoint[ jointIndex ] = m_physxPhysics->createShape( PxSphereGeometry( jointRadius[ jointIndex ] ),
+				*m_physxMaterial, true );
+			handInfo.handCollider->attachShape( *handInfo.colliderJoint[ jointIndex ] );
+		}
+
+		PxRigidBodyExt::updateMassAndInertia( *handInfo.handCollider, 10.0f );
+		m_physxScene->addActor( *handInfo.handCollider );
+
+		PxFixedJoint *handJoint = PxFixedJointCreate( *m_physxPhysics,
+				handInfo.grabActor, toPx( Transform() ),
+				handInfo.handCollider, toPx( Transform() ) );
+	}
+
+	// update the hand collider joints
+	for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
+	{
+		handInfo.colliderJoint[ jointIndex ]->setLocalPose( toPx( jointToStage[ jointIndex ] * stageToJoint[ XR_HAND_JOINT_WRIST_EXT ] ) );
+	}
+
+	handInfo.wristToWorld = toDE( jointLocations[ XR_HAND_JOINT_WRIST_EXT ].pose );
 }
+
+// TODO:
+//move hand position to be more central so that it doesn't rotate around the wrist?
+//Slave the model rendering to the collider position so I can see what it's doing
+//Maybe a fixed joint is too rigid? Would a distance joint be too weak?
+//would help if the plane were rendered so I could see what I was colliding with
+//a spawnable model with some height would HELP too
+//spawned objects should probably spawn a bit away from the actual Hand so they don't immediately shoot away because of the interpenetration
 
 GLTFMeshGeometryVector GLTFMeshPhysXGeometry( GLTF::Model* model )
 {
