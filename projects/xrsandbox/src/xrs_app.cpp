@@ -33,6 +33,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <list>
 
 #ifndef NOMINMAX
 #	define NOMINMAX
@@ -112,6 +113,18 @@ enum class Hand
 };
 
 static const Hand BothHands[] = { Hand::Left, Hand::Right };
+
+const char* toStr( Hand hand )
+{
+	switch ( hand )
+	{
+	case Hand::Left: return "Left";
+	case Hand::Right: return "Right";
+	case Hand::None: return "None";
+	case Hand::Any: return "Any";
+	default: return "UNKNOWN!";
+	}
+}
 
 XrPath HandPath( Hand hand )
 {
@@ -236,10 +249,12 @@ struct HandInfo
 
 	PxRigidDynamic* handCollider = nullptr;
 	PxShape* colliderJoint[ XR_HAND_JOINT_COUNT_EXT ] = {};
+	PxFixedJoint* colliderFixedJoint = nullptr;
+	uint32_t handTouches = 0;
 };
 
 
-class XRSApp: public XrAppBase
+class XRSApp: public XrAppBase, public PxSimulationEventCallback
 {
 	typedef XrAppBase super;
 public:
@@ -281,6 +296,16 @@ public:
 	void UpdateHandPoses( Hand hand, XrTime displayTime );
 	
 	WorldObject* SpawnObject( const Transform& objectToWorld, const std::string& modelPath );
+
+	// -------------- PxSimulationEventCallback --------------
+	virtual void onConstraintBreak( PxConstraintInfo* /*constraints*/, PxU32 /*count*/ ) override;
+	virtual void onWake( PxActor** /*actors*/, PxU32 /*count*/ ) override {}
+	virtual void onSleep( PxActor** /*actors*/, PxU32 /*count*/ ) override {}
+	virtual void onTrigger( PxTriggerPair* pairs, PxU32 count ) override;
+	virtual void onAdvance( const PxRigidBody* const*, const PxTransform*, const PxU32 ) override {}
+	virtual void onContact( const PxContactPairHeader& /*pairHeader*/, const PxContactPair* pairs, PxU32 count ) override;
+
+
 private:
 	PxRigidDynamic* CreateActorForModel( GLTF::Model* mode, const GLTFMeshGeometryVector& geos, const Transform& objectToWorld );
 	InputState ReadInputState( Hand hand, XrTime displayTime );
@@ -388,6 +413,43 @@ bool XRSApp::PostSession()
 	return true;
 }
 
+void setActorName( PxActor* actor, const std::string& name )
+{
+	static std::list<std::string> names;
+	auto i = names.insert( names.begin(), name );
+	actor->setName( i->c_str() );
+}
+
+enum class FilterObjectType
+{
+	Misc = 0,
+	HandCollider = 1,
+};
+
+struct FilterDataHelper
+{
+	FilterDataHelper( const PxFilterData& data ) : filterData( data ) {};
+	FilterDataHelper( FilterObjectType objType, Hand hand )
+	{
+		filterData.word0 = static_cast<uint32_t>( objType );
+		filterData.word1 = static_cast<uint32_t>( hand );
+	}
+
+	FilterObjectType getObjectType() const { return static_cast<FilterObjectType>( filterData.word0 ); }
+	Hand getHand() const 
+	{
+		if ( getObjectType() == FilterObjectType::HandCollider )
+			return static_cast<Hand>( filterData.word1 );
+		else
+			return Hand::None;
+	}
+
+	operator PxFilterData& ( ) { return filterData;  }
+	operator const PxFilterData& ( ) const { return filterData; }
+
+	PxFilterData filterData;
+};
+
 bool XRSApp::InitPhysics()
 {
 	m_physxFoundation = PxCreateFoundation( PX_PHYSICS_VERSION, m_physxAllocator, m_physxErrorCallback );
@@ -405,7 +467,23 @@ bool XRSApp::InitPhysics()
 	sceneDesc.gravity = PxVec3( 0.0f, -9.81f, 0.0f );
 	m_physxDispatcher = PxDefaultCpuDispatcherCreate( 2 );
 	sceneDesc.cpuDispatcher = m_physxDispatcher;
-	sceneDesc.filterShader = PxDefaultSimulationFilterShader;
+	sceneDesc.filterShader = []( PxFilterObjectAttributes attributes0, PxFilterData filterData0,
+			PxFilterObjectAttributes attributes1, PxFilterData filterData1,
+			PxPairFlags & pairFlags, const void* constantBlock, PxU32 constantBlockSize ) ->PxFilterFlags
+	{
+		if ( FilterDataHelper( filterData0 ).getObjectType() == FilterObjectType::HandCollider
+			|| FilterDataHelper( filterData1 ).getObjectType() == FilterObjectType::HandCollider )
+		{
+			pairFlags = PxPairFlag::eTRIGGER_DEFAULT | PxPairFlag::eCONTACT_DEFAULT;
+			return PxFilterFlag::eDEFAULT;
+		}
+
+		// otherwise, we want default behavior
+		return PxDefaultSimulationFilterShader( attributes0, filterData0, attributes1, filterData1, pairFlags, 
+			constantBlock, constantBlockSize );
+	};
+	//sceneDesc.filterShader = PxDefaultSimulationFilterShader;
+	sceneDesc.simulationEventCallback = this;
 	m_physxScene = m_physxPhysics->createScene( sceneDesc );
 
 	PxPvdSceneClient* pvdClient = m_physxScene->getScenePvdClient();
@@ -418,6 +496,7 @@ bool XRSApp::InitPhysics()
 	m_physxMaterial = m_physxPhysics->createMaterial( 0.5f, 0.5f, 0.6f );
 
 	m_groundPlane = PxCreatePlane( *m_physxPhysics, PxPlane( 0, 1, 0, -1.f ), *m_physxMaterial );
+	m_groundPlane->setName( "Ground Plane" );
 	m_physxScene->addActor( *m_groundPlane );
 
 	for ( Hand hand : BothHands )
@@ -428,6 +507,8 @@ bool XRSApp::InitPhysics()
 		handInfo.grabActor = m_physxPhysics->createRigidDynamic( toPx( Transform() ) );
 		handInfo.grabActor->setRigidBodyFlag( PxRigidBodyFlag::eKINEMATIC, true );
 		handInfo.grabActor->attachShape( *shape );
+		setActorName( handInfo.grabActor, std::string( "Grab Actor " ) + toStr( hand ) );
+
 		m_physxScene->addActor( *handInfo.grabActor );
 	}
 
@@ -518,13 +599,14 @@ InputState XRSApp::ReadInputState( Hand hand, XrTime displayTime )
 
 bool isBroken( PxJoint* joint )
 {
-	return ( static_cast<uint32_t>( joint->getConstraintFlags() ) & PxConstraintFlag::eBROKEN ) != 0;
+	return joint->getConstraintFlags().isSet( PxConstraintFlag::eBROKEN );
 }
 
 void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 {
-	m_physxScene->simulate( (PxReal)ElapsedTime );
-	m_physxScene->fetchResults( true );	// read input
+	// never simulate more than a tenth of a second, just in case we were at a breakpoint
+	m_physxScene->simulate( std::min( 0.1f, (float)ElapsedTime ) );
+	m_physxScene->fetchResults( true );
 
 	XrActiveActionSet activeActionSets[] =
 	{
@@ -635,6 +717,34 @@ void XRSApp::Update( double CurrTime, double ElapsedTime, XrTime displayTime )
 			break;
 		}
 
+
+		if ( handInfo.colliderFixedJoint )
+		{
+			if ( isBroken( handInfo.colliderFixedJoint ) )
+			{
+				OutputDebugString( L"Broken\n" );
+				// if the collider fixed joint is broken, get rid of it. We'll be kept sort of in
+				// place by the springs
+				handInfo.colliderFixedJoint->release();
+				handInfo.colliderFixedJoint = nullptr;
+			}
+			else
+			{
+				// everything is fine.
+			}
+		}
+		else
+		{
+			// we're using the springs to position the hand. See if we can switch back to the fixed joint
+			if ( !handInfo.handTouches )
+			{
+				OutputDebugString( L"Fixed\n" );
+				handInfo.colliderFixedJoint = PxFixedJointCreate( *m_physxPhysics,
+					handInfo.grabActor, toPx( Transform() ),
+					handInfo.handCollider, toPx( Transform() ) );
+				handInfo.colliderFixedJoint->setBreakForce( 5.f, 5.f );
+			}
+		}
 	}
 
 	UpdateHandPoses( Hand::Left, displayTime );
@@ -800,21 +910,54 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 
 	if ( !handInfo.handCollider )
 	{
-		handInfo.handCollider = m_physxPhysics->createRigidDynamic( toPx( jointsToParent[ XR_HAND_JOINT_WRIST_EXT ]) );
+		handInfo.handCollider = m_physxPhysics->createRigidDynamic( toPx( jointToStage[ XR_HAND_JOINT_WRIST_EXT ]) );
+		setActorName( handInfo.handCollider, std::string( "Collider " ) + toStr( hand ) );
 
 		for ( uint32_t jointIndex = 0; jointIndex < XR_HAND_JOINT_COUNT_EXT; jointIndex++ )
 		{
 			handInfo.colliderJoint[ jointIndex ] = m_physxPhysics->createShape( PxSphereGeometry( jointRadius[ jointIndex ] ),
 				*m_physxMaterial, true );
+			handInfo.colliderJoint[ jointIndex ]->setSimulationFilterData( 
+				FilterDataHelper( FilterObjectType::HandCollider, hand ) );
 			handInfo.handCollider->attachShape( *handInfo.colliderJoint[ jointIndex ] );
 		}
 
-		PxRigidBodyExt::updateMassAndInertia( *handInfo.handCollider, 10.0f );
+		handInfo.handCollider->setActorFlag( PxActorFlag::eDISABLE_GRAVITY, true );
+
+		PxRigidBodyExt::updateMassAndInertia( *handInfo.handCollider, 100.0f );
 		m_physxScene->addActor( *handInfo.handCollider );
 
-		PxFixedJoint *handJoint = PxFixedJointCreate( *m_physxPhysics,
+		handInfo.colliderFixedJoint = PxFixedJointCreate( *m_physxPhysics,
 				handInfo.grabActor, toPx( Transform() ),
 				handInfo.handCollider, toPx( Transform() ) );
+		handInfo.colliderFixedJoint->setBreakForce( 5.f, 5.f );
+
+		float springStiffness = 10000.f;
+		float springDamping = 10000000.f;
+
+		PxDistanceJoint * handJoint = PxDistanceJointCreate( *m_physxPhysics,
+			handInfo.grabActor, toPx( Transform() ),
+			handInfo.handCollider, toPx( Transform() ) );
+		handJoint->setDistanceJointFlag( PxDistanceJointFlag::eSPRING_ENABLED, true );
+		handJoint->setStiffness( springStiffness );
+		handJoint->setDamping( springDamping );
+		handJoint->setTolerance( 0.01f );
+
+		handJoint = PxDistanceJointCreate( *m_physxPhysics,
+			handInfo.grabActor, toPx( Transform( float3( 0.1f, 0, 0 ) ) ),
+			handInfo.handCollider, toPx( Transform( float3( 0.1f, 0, 0 ) ) ) );
+		handJoint->setDistanceJointFlag( PxDistanceJointFlag::eSPRING_ENABLED, true );
+		handJoint->setStiffness( springStiffness );
+		handJoint->setDamping( springDamping );
+		handJoint->setTolerance( 0.01f );
+
+		handJoint = PxDistanceJointCreate( *m_physxPhysics,
+			handInfo.grabActor, toPx( Transform( float3( 0, 0, -0.1f ) ) ),
+			handInfo.handCollider, toPx( Transform( float3( 0, 0, -0.1f ) ) ) );
+		handJoint->setDistanceJointFlag( PxDistanceJointFlag::eSPRING_ENABLED, true );
+		handJoint->setStiffness( springStiffness );
+		handJoint->setDamping( springDamping );
+		handJoint->setTolerance( 0.01f );
 	}
 
 	// update the hand collider joints
@@ -833,6 +976,7 @@ void XRSApp::UpdateHandPoses( Hand hand, XrTime displayTime )
 //would help if the plane were rendered so I could see what I was colliding with
 //a spawnable model with some height would HELP too
 //spawned objects should probably spawn a bit away from the actual Hand so they don't immediately shoot away because of the interpenetration
+//Need to figure out how to get onContact to be called
 
 GLTFMeshGeometryVector GLTFMeshPhysXGeometry( GLTF::Model* model )
 {
@@ -898,6 +1042,8 @@ PxRigidDynamic * XRSApp::CreateActorForModel( GLTF::Model* model, const GLTFMesh
 		}
 	}
 
+	setActorName( body, std::string( "Spawn " ) + std::to_string( m_worldObjects.size() ) );
+
 	PxRigidBodyExt::updateMassAndInertia( *body, 10.0f );
 	m_physxScene->addActor( *body );
 
@@ -927,3 +1073,74 @@ WorldObject* XRSApp::SpawnObject( const Transform& objectToWorld, const std::str
 	return p;
 }
 
+
+// -------------- PxSimulationEventCallback --------------
+void XRSApp::onConstraintBreak( PxConstraintInfo* constraints, PxU32 count )
+{
+	//for ( uint32_t c = 0; c < count; c++ )
+	//{
+	//	PxConstraintInfo& constraint = constraints[ c ];
+	//	switch( constraint.type )
+	//}
+}
+
+void XRSApp::onTrigger( PxTriggerPair* pairs, PxU32 count )
+{
+	for ( uint32_t i = 0; i < count; i++ )
+	{
+		PxTriggerPair& pair= pairs[ i ];
+		if ( pair.status & PxPairFlag::eNOTIFY_TOUCH_FOUND )
+		{
+			for ( Hand hand : BothHands )
+			{
+				if ( handInfo( hand ).handCollider == pair.triggerActor || handInfo( hand ).handCollider == pair.otherActor )
+				{
+					handInfo( hand ).handTouches++;
+				}
+			}
+		}
+
+		if ( pair.status & PxPairFlag::eNOTIFY_TOUCH_LOST)
+		{
+			for ( Hand hand : BothHands )
+			{
+				if ( handInfo( hand ).handCollider == pair.triggerActor || handInfo( hand ).handCollider == pair.otherActor )
+				{
+					handInfo( hand ).handTouches--;
+				}
+			}
+		}
+	}
+
+}
+
+void XRSApp::onContact( const PxContactPairHeader& pairHeader, const PxContactPair* pairs, PxU32 count )
+{
+	for ( uint32_t i = 0; i < count; i++ )
+	{
+		const PxContactPair& contact = pairs[ i ];
+		if ( contact.events & PxPairFlag::eNOTIFY_TOUCH_FOUND )
+		{
+			for ( Hand hand : BothHands )
+			{
+				if ( handInfo( hand ).handCollider == contact.shapes[ 0 ]->getActor() 
+					|| handInfo( hand ).handCollider == contact.shapes[ 1 ]->getActor() )
+				{
+					handInfo( hand ).handTouches++;
+				}
+			}
+		}
+
+		if ( contact.events & PxPairFlag::eNOTIFY_TOUCH_LOST )
+		{
+			for ( Hand hand : BothHands )
+			{
+				if ( handInfo( hand ).handCollider == contact.shapes[ 0 ]->getActor()
+					|| handInfo( hand ).handCollider == contact.shapes[ 1 ]->getActor() )
+				{
+					handInfo( hand ).handTouches--;
+				}
+			}
+		}
+	}
+}
